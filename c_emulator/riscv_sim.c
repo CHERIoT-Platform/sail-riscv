@@ -172,10 +172,10 @@ static void print_usage(const char *argv0, int ec)
 #endif
   struct option *opt = options;
   while (opt->name) {
-    if (opt->flag == NULL)
+    if (isprint(opt->val))
       fprintf(stdout, "\t -%c\t --%s\n", (char)opt->val, opt->name);
     else
-      fprintf(stdout, "\t\t --%s\n", opt->name);
+      fprintf(stdout, "\t   \t --%s\n", opt->name);
     opt++;
   }
   exit(ec);
