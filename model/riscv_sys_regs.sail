@@ -848,7 +848,7 @@ function get_sew() = {
   }
 }
 /* this returns the value of SEW in bytes */
-val get_sew_bytes : unit -> {|1, 2, 4, 8|}
+val get_sew_bytes : unit -> {1, 2, 4, 8}
 function get_sew_bytes() = {
   match get_sew_pow() {
     3 => 1,
@@ -860,7 +860,7 @@ function get_sew_bytes() = {
 
 /* the vector register group multiplier (LMUL) */
 /* this returns the power of 2 for LMUL */
-val get_lmul_pow : unit -> {|-3, -2, -1, 0, 1, 2, 3|}
+val get_lmul_pow : unit -> range(-3, 3)
 function get_lmul_pow() = {
   match vtype[vlmul] {
     0b101 => -3,
