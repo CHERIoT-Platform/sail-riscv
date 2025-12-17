@@ -208,3 +208,6 @@ function log2(n) = {
   };
   result
 }
+
+$include <concurrency_interface.sail>
+instantiation sail_barrier with 'barrier = barrier_kind
