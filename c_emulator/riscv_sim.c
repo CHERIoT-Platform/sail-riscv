@@ -70,6 +70,9 @@ static bool rvfi_dii = false;
 static unsigned rvfi_trace_version = 1;
 static int rvfi_dii_port;
 static int rvfi_dii_sock;
+
+static bool rvfi_file_mode = false;
+static const char *instr_file_path = NULL;
 #endif
 
 unsigned char *spike_dtb = NULL;
@@ -149,6 +152,7 @@ static struct option options[] = {
     {"signature-granularity",       required_argument, 0, 'g'                     },
 #ifdef RVFI_DII
     {"rvfi-dii",                    required_argument, 0, 'r'                     },
+    {"instr-file",                  required_argument, 0, 'f'                     },
 #endif
     {"help",                        no_argument,       0, 'h'                     },
     {"trace",                       optional_argument, 0, 'v'                     },
@@ -278,6 +282,7 @@ static int process_args(int argc, char **argv)
                     "h"
 #ifdef RVFI_DII
                     "r:"
+                    "f:"
 #endif
 #ifdef SAILCOV
                     "c:"
@@ -395,6 +400,12 @@ static int process_args(int argc, char **argv)
       rvfi_dii_port = atoi(optarg);
       fprintf(stderr, "using %d as RVFI port.\n", rvfi_dii_port);
       break;
+    case 'f':
+      rvfi_dii = true;
+      rvfi_file_mode = true;
+      instr_file_path = strdup(optarg);
+      fprintf(stderr, "using %s for instruction input.\n", instr_file_path);
+      break;
 #endif
     case 'V':
       set_config_print(optarg, false);
@@ -427,7 +438,7 @@ static int process_args(int argc, char **argv)
   if (do_dump_dts)
     dump_dts();
 #ifdef RVFI_DII
-  if (optind > argc || (optind == argc && !rvfi_dii))
+  if (optind > argc || (optind == argc && (!rvfi_dii && instr_file_path == NULL)))
     print_usage(argv[0], 0);
 #else
   if (optind >= argc) {
@@ -809,6 +820,38 @@ void flush_logs(void)
 
 #ifdef RVFI_DII
 
+#define MAX_LINE_LEN 8192
+uint32_t *instr_buffer = NULL;
+size_t instr_buffer_size = 0;
+size_t instr_buffer_pos = 0;
+
+void read_instr_file(const char* path)
+{
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    fprintf(stderr, "Cannot open instruction file '%s': %s\n", instr_file_path, strerror(errno));
+    exit(1);
+  }
+  char line[MAX_LINE_LEN];
+  instr_buffer_size = 0;
+  instr_buffer = malloc(MAX_LINE_LEN * sizeof(uint32_t));
+  if (!instr_buffer) {
+    fprintf(stderr, "Connot allocate memory for instruction buffer.\n");
+    exit(1);
+  }
+
+  while (fgets(line, sizeof(line), f)) {
+    char *hex_start = strstr(line, "0x");
+    if (!hex_start) continue;
+
+    uint32_t instr = (uint32_t)strtoul(hex_start, NULL, 16);
+    instr_buffer[instr_buffer_size++] = instr;
+  }
+  fclose(f);
+  instr_buffer_pos = 0;
+}
+
+
 typedef void (*packet_reader_fn)(lbits *rop, unit);
 static void get_and_send_rvfi_packet(packet_reader_fn reader)
 {
@@ -878,6 +921,9 @@ void run_sail(void)
   int insn_cnt = 0;
 #ifdef RVFI_DII
   bool need_instr = true;
+  if (rvfi_file_mode) {
+    read_instr_file(instr_file_path);
+  }
 #endif
 
   struct timeval interval_start;
@@ -888,7 +934,23 @@ void run_sail(void)
 
   while (!zhtif_done && (insn_limit == 0 || total_insns < insn_limit)) {
 #ifdef RVFI_DII
-    if (rvfi_dii) {
+    if (rvfi_file_mode) {
+      if (instr_buffer_pos < instr_buffer_size) {
+        uint32_t instr = instr_buffer[instr_buffer_pos++];
+        zrvfi_set_instr_packet(instr);
+        zrvfi_zzero_exec_packet(UNIT);
+        sail_int sail_step;
+        CREATE(sail_int)(&sail_step);
+        CONVERT_OF(sail_int, mach_int)(&sail_step, step_no);
+        stepped = zstep(sail_step);
+        if (have_exception)
+          goto step_exception;
+        flush_logs();
+        KILL(sail_int)(&sail_step);
+      } else {
+        break;
+      }
+    } else if (rvfi_dii) {
       mach_bits instr_bits;
       if (config_print_rvfi) {
         fprintf(stderr, "Waiting for cmd packet... ");
@@ -1117,7 +1179,9 @@ int main(int argc, char **argv)
 
 #ifdef RVFI_DII
   uint64_t entry;
-  if (rvfi_dii) {
+  if (rvfi_file_mode) {
+    entry = 0x80000000;
+  } else if (rvfi_dii) {
     entry = 0x80000000;
     int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_sock == -1) {
