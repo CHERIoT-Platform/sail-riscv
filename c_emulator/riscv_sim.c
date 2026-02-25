@@ -22,6 +22,9 @@
 #include "riscv_platform.h"
 #include "riscv_platform_impl.h"
 #include "riscv_sail.h"
+#ifdef RVFI_DII
+#include "mem_dump.h"
+#endif
 
 #ifdef ENABLE_SPIKE
 #include "tv_spike_intf.h"
@@ -174,6 +177,7 @@ static void print_usage(const char *argv0, int ec)
   fprintf(stdout, "Usage: %s [options] <elf_file> [<elf_file> ...]\n", argv0);
 #ifdef RVFI_DII
   fprintf(stdout, "       %s [options] -r <port>\n", argv0);
+  fprintf(stdout, "       %s [options] -f <instr_file>\n", argv0);
 #endif
   struct option *opt = options;
   while (opt->name) {
@@ -438,7 +442,7 @@ static int process_args(int argc, char **argv)
   if (do_dump_dts)
     dump_dts();
 #ifdef RVFI_DII
-  if (optind > argc || (optind == argc && (!rvfi_dii && instr_file_path == NULL)))
+  if (optind > argc || (optind == argc && !rvfi_dii && instr_file_path == NULL))
     print_usage(argv[0], 0);
 #else
   if (optind >= argc) {
@@ -821,36 +825,40 @@ void flush_logs(void)
 #ifdef RVFI_DII
 
 #define MAX_LINE_LEN 8192
-uint32_t *instr_buffer = NULL;
-size_t instr_buffer_size = 0;
-size_t instr_buffer_pos = 0;
+static uint32_t *instr_buffer      = NULL;
+static size_t    instr_buffer_size = 0;
+static size_t    instr_buffer_pos  = 0;
 
-void read_instr_file(const char* path)
+/*
+ * Read instructions from a text file into instr_buffer.
+ * Each line is scanned for the first "0x" token; lines without one
+ * are skipped (comments, labels, blank lines, etc.).
+ * This means test.S files like ".4byte 0x47018113 # comment" work directly.
+ */
+static void read_instr_file(const char *path)
 {
   FILE *f = fopen(path, "r");
   if (!f) {
-    fprintf(stderr, "Cannot open instruction file '%s': %s\n", instr_file_path, strerror(errno));
+    fprintf(stderr, "Cannot open instruction file '%s': %s\n", path,
+            strerror(errno));
     exit(1);
   }
   char line[MAX_LINE_LEN];
   instr_buffer_size = 0;
-  instr_buffer = malloc(MAX_LINE_LEN * sizeof(uint32_t));
+  instr_buffer      = malloc(MAX_LINE_LEN * sizeof(uint32_t));
   if (!instr_buffer) {
-    fprintf(stderr, "Connot allocate memory for instruction buffer.\n");
+    fprintf(stderr, "Cannot allocate memory for instruction buffer.\n");
     exit(1);
   }
-
   while (fgets(line, sizeof(line), f)) {
     char *hex_start = strstr(line, "0x");
-    if (!hex_start) continue;
-
-    uint32_t instr = (uint32_t)strtoul(hex_start, NULL, 16);
-    instr_buffer[instr_buffer_size++] = instr;
+    if (!hex_start)
+      continue;
+    instr_buffer[instr_buffer_size++] = (uint32_t)strtoul(hex_start, NULL, 16);
   }
   fclose(f);
   instr_buffer_pos = 0;
 }
-
 
 typedef void (*packet_reader_fn)(lbits *rop, unit);
 static void get_and_send_rvfi_packet(packet_reader_fn reader)
@@ -948,6 +956,13 @@ void run_sail(void)
         flush_logs();
         KILL(sail_int)(&sail_step);
       } else {
+        /* All instructions consumed: dump memory then exit. */
+        static uint64_t file_run_count = 0;
+        char dump_filename[256];
+        snprintf(dump_filename, sizeof(dump_filename),
+                 "memdump_%06" PRIu64 ".elf", file_run_count++);
+        mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size);
+        fprintf(stderr, "Memory dumped to %s\n", dump_filename);
         break;
       }
     } else if (rvfi_dii) {
@@ -999,6 +1014,15 @@ void run_sail(void)
         } else {
           zrvfi_halt_exec_packet(UNIT);
           rvfi_send_trace(rvfi_trace_version);
+          /* Dump memory once after all instructions have been executed.
+           * This captures the settled memory state (including any
+           * self-modifications from jump/store instructions) so it can be
+           * loaded back for a second-pass RVFI execution. */
+          static uint64_t dii_trace_count = 0;
+          char dump_filename[256];
+          snprintf(dump_filename, sizeof(dump_filename),
+                   "memdump_%06" PRIu64 ".elf", dii_trace_count++);
+          mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size);
           return;
         }
       }
@@ -1046,7 +1070,7 @@ void run_sail(void)
       flush_logs();
       KILL(sail_int)(&sail_step);
       rvfi_send_trace(rvfi_trace_version);
-    } else /* if (!rvfi_dii) */
+    } else /* if (!rvfi_dii && !rvfi_file_mode) */
 #endif
     { /* run a Sail step */
       sail_int sail_step;
