@@ -1,0 +1,47 @@
+# test_exc_overwrite.txt – Second exception overwrites handler at 0x0
+#
+# Scenario:
+#   1. First ebreak traps to 0x0.  Handler #1 written there: sets x10=100,
+#      fixes mepc, mrets back.
+#   2. Second ebreak traps to 0x0.  Handler #2 OVERWRITES 0x0: sets x10=200,
+#      fixes mepc, mrets back.
+#   3. Final instruction addi x3, x0, 3 runs at 0x80000008.
+#
+# The dump ELF captures only the FINAL memory state:
+#   0x0: handler #2 (x10=200 marker, NOT x10=100)
+#   0x80000000: first  ebreak
+#   0x80000004: second ebreak
+#   0x80000008: addi x3, x0, 3
+#
+# Re-execution from dump ELF:
+#   First ebreak  → handler #2 runs at 0x0 → x10=200 (first handler is GONE)
+#   Second ebreak → handler #2 runs at 0x0 again → x10=200
+#   addi x3,x0,3 → x3=3
+#   Then falls into zero memory → clean stop.
+#
+# This demonstrates that dump re-execution reflects the FINAL overwritten
+# state, not the original DII-time handler sequence.
+
+# ── Main code ────────────────────────────────────────────────────────────
+0x00100073   # ebreak  → trap #1 → PC = 0x0
+
+# ── Exception handler #1 at 0x0 (written by DII after first trap) ────────
+0x06400513   # addi x10, x0, 100      ; marker: first handler  (x10=100)
+0x341020F3   # csrr x1, mepc          ; read faulting PC
+0x00408093   # addi x1, x1, 4         ; skip ebreak
+0x34109073   # csrw mepc, x1          ; update mepc
+0x30200073   # mret                   ; return to 0x80000004
+
+# ── Resumed at 0x80000004 ────────────────────────────────────────────────
+0x00100073   # ebreak  → trap #2 → PC = 0x0
+
+# ── Exception handler #2 at 0x0 (OVERWRITES handler #1!) ─────────────────
+0x0C800513   # addi x10, x0, 200      ; marker: second handler (x10=200)
+#              ^^ overwrites the 0x06400513 (addi x10,x0,100) from handler #1
+0x341020F3   # csrr x1, mepc
+0x00408093   # addi x1, x1, 4
+0x34109073   # csrw mepc, x1
+0x30200073   # mret                   ; return to 0x80000008
+
+# ── Final instruction at 0x80000008 ──────────────────────────────────────
+0x00300193   # addi x3, x0, 3         ; x3 = 3  (observable result)

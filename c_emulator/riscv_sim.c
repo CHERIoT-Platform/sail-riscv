@@ -488,12 +488,14 @@ uint64_t load_sail(char *f, bool main_file)
     return entry;
   }
   fprintf(stdout, "ELF Entry @ 0x%" PRIx64 "\n", entry);
-  /* locate htif ports */
+  /* locate htif ports – non-fatal so memory-dump ELFs (which embed tohost=0)
+   * load cleanly; the default rv_htif_tohost value is preserved on failure. */
   if (lookup_sym(f, "tohost", &rv_htif_tohost) < 0) {
-    fprintf(stderr, "Unable to locate htif tohost port.\n");
-    exit(1);
+    fprintf(stderr, "tohost symbol not found; using default 0x%" PRIx64 "\n",
+            rv_htif_tohost);
+  } else {
+    fprintf(stderr, "tohost located at 0x%0" PRIx64 "\n", rv_htif_tohost);
   }
-  fprintf(stderr, "tohost located at 0x%0" PRIx64 "\n", rv_htif_tohost);
   /* locate test-signature locations if any */
   if (!lookup_sym(f, "begin_signature", &begin_sig)) {
     fprintf(stdout, "begin_signature: 0x%0" PRIx64 "\n", begin_sig);
@@ -652,13 +654,23 @@ void init_sail(uint64_t elf_entry)
     rv_clint_size = UINT64_C(0);
     rv_htif_tohost = UINT64_C(0);
     zPC = elf_entry;
-  } else
-#endif
+  } else {
+    /* Non-DII mode in RVFI binary: re-executing a dump ELF.
+     * The RVFI fetch function always reads from rvfi_instruction[rvfi_insn],
+     * so zext_rvfi_init must be called to put that state into a known-good
+     * state.  We skip the boot ROM and jump directly to the ELF entry point;
+     * the normal platform memory map (rv_ram_base etc.) stays at its default
+     * so the full 64 MB RAM window is available. */
+    zext_rvfi_init(UNIT);
+    zPC = elf_entry;
+  }
+#else
   if (config_use_boot_rom) {
     init_sail_reset_vector(elf_entry);
   } else {
     zPC = elf_entry;
   }
+#endif
 
   // this is probably unnecessary now; remove
   if (!rv_enable_rvc)
@@ -945,6 +957,23 @@ void run_sail(void)
     if (rvfi_file_mode) {
       if (instr_buffer_pos < instr_buffer_size) {
         uint32_t instr = instr_buffer[instr_buffer_pos++];
+        /* Write the instruction bytes into Sail's memory model at the
+         * current PC before injecting it via DII.
+         *
+         * The DII interface bypasses the normal memory-fetch path, so
+         * without this the instruction bytes never appear in RAM.  Writing
+         * them here ensures that the post-execution memory dump captures the
+         * full instruction stream, including any locations that a subsequent
+         * store instruction may later overwrite.
+         *
+         * Instruction width: RISC-V instructions with bits[1:0] == 0b11 are
+         * 32-bit; all other encodings (RVC) are 16-bit. */
+        {
+          uint64_t pc        = zPC;
+          uint32_t instr_len = ((instr & 0x3U) == 0x3U) ? 4U : 2U;
+          for (uint32_t b = 0; b < instr_len; b++)
+            write_mem(pc + b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+        }
         zrvfi_set_instr_packet(instr);
         zrvfi_zzero_exec_packet(UNIT);
         sail_int sail_step;
@@ -956,12 +985,18 @@ void run_sail(void)
         flush_logs();
         KILL(sail_int)(&sail_step);
       } else {
-        /* All instructions consumed: dump memory then exit. */
+        /* All instructions consumed: dump the settled post-execution memory
+         * state to an ELF executable.  This is necessary because jump/branch/
+         * store instructions may have modified the instruction stream in RAM,
+         * making the original instruction file inconsistent with what was
+         * actually executed.  The dumped ELF captures the exact memory state
+         * and sets the entry point to rv_ram_base so it can be reloaded and
+         * re-executed for a fully consistent, reproducible run. */
         static uint64_t file_run_count = 0;
         char dump_filename[256];
         snprintf(dump_filename, sizeof(dump_filename),
                  "memdump_%06" PRIu64 ".elf", file_run_count++);
-        mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size);
+        mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size, rv_ram_base, (int)zxlen_val);
         fprintf(stderr, "Memory dumped to %s\n", dump_filename);
         break;
       }
@@ -1016,13 +1051,15 @@ void run_sail(void)
           rvfi_send_trace(rvfi_trace_version);
           /* Dump memory once after all instructions have been executed.
            * This captures the settled memory state (including any
-           * self-modifications from jump/store instructions) so it can be
-           * loaded back for a second-pass RVFI execution. */
+           * self-modifications from jump/branch/store instructions) so it
+           * can be reloaded and re-executed for a consistent, reproducible
+           * second-pass RVFI execution.  The entry point is set to
+           * rv_ram_base so the loader knows where to begin execution. */
           static uint64_t dii_trace_count = 0;
           char dump_filename[256];
           snprintf(dump_filename, sizeof(dump_filename),
                    "memdump_%06" PRIu64 ".elf", dii_trace_count++);
-          mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size);
+          mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size, rv_ram_base, (int)zxlen_val);
           return;
         }
       }
@@ -1073,6 +1110,47 @@ void run_sail(void)
     } else /* if (!rvfi_dii && !rvfi_file_mode) */
 #endif
     { /* run a Sail step */
+#ifdef RVFI_DII
+      /* Non-DII mode in the RVFI binary (re-executing a dump ELF).
+       * The RVFI model's fetch function always reads from
+       * rvfi_instruction[rvfi_insn] rather than fetching from physical
+       * memory.  We therefore read the instruction bytes from Sail's
+       * memory model at the current PC and inject them as a DII packet
+       * before each step, emulating what a real fetch would do. */
+      {
+        uint64_t pc = zPC;
+        /* Fetch the instruction bytes from Sail's memory model. */
+        uint8_t  b0 = (uint8_t)read_mem(pc + 0);
+        uint8_t  b1 = (uint8_t)read_mem(pc + 1);
+        uint32_t instr;
+        if ((b0 & 0x3U) != 0x3U) {
+          /* 16-bit RVC instruction */
+          instr = (uint32_t)b0 | ((uint32_t)b1 << 8);
+        } else {
+          /* 32-bit instruction */
+          instr = (uint32_t)b0
+                | ((uint32_t)b1                          << 8)
+                | ((uint32_t)(uint8_t)read_mem(pc + 2) << 16)
+                | ((uint32_t)(uint8_t)read_mem(pc + 3) << 24);
+        }
+        /* Termination: an all-zero instruction word means we have walked
+         * into uninitialised memory – stop cleanly.
+         *
+         * We intentionally do NOT use a PC-range check here.  A PC-range
+         * check would incorrectly terminate re-execution when a legitimate
+         * exception handler runs at address 0x0 (the RISC-V default mtvec).
+         * All-zero (0x00000000) is never a valid RISC-V instruction, so it
+         * is a safe and portable end-of-program sentinel. */
+        if (instr == 0) {
+          fprintf(stderr,
+                  "[re-exec] zero instruction at PC 0x%" PRIx64 " – stopping.\n",
+                  pc);
+          break;
+        }
+        zrvfi_set_instr_packet(instr);
+        zrvfi_zzero_exec_packet(UNIT);
+      }
+#endif
       sail_int sail_step;
       CREATE(sail_int)(&sail_step);
       CONVERT_OF(sail_int, mach_int)(&sail_step, step_no);
