@@ -27,6 +27,19 @@
  * entry_point : Address at which re-execution should begin (typically
  *               rv_ram_base, i.e. 0x80000000 in RVFI modes).
  * xlen        : Address width in bits – pass (int)zxlen_val (32 or 64).
+ *
+ * Implemented in mem_dump.cpp (C++ / ELFIO).  The #ifdef __cplusplus guards
+ * give this declaration C linkage when included from C++ translation units,
+ * matching the extern "C" definition in mem_dump.cpp.
  */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void mem_dump_elf(const char *filename, uint64_t base, uint64_t size,
                   uint64_t entry_point, int xlen);
+
+#ifdef __cplusplus
+}
+#endif
