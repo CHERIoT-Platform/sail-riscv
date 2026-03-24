@@ -56,6 +56,8 @@ const char *RV32ISA = "RV32IMAC";
 #define OPT_ENABLE_WRITABLE_FIOM 1001
 #define OPT_PMP_COUNT 1002
 #define OPT_PMP_GRAIN 1003
+#define OPT_RVFI_OUTPUT 1004
+#define OPT_ELF_OUTPUT  1005
 
 static bool do_dump_dts = false;
 static bool do_show_times = false;
@@ -76,6 +78,10 @@ static int rvfi_dii_sock;
 
 static bool rvfi_file_mode = false;
 static const char *instr_file_path = NULL;
+/* Path for binary RVFI trace output in file mode (NULL = don't write) */
+static const char *rvfi_output_path = NULL;
+/* Path for ELF memory dump in file mode (NULL = auto-generate name) */
+static const char *elf_output_path  = NULL;
 #endif
 
 unsigned char *spike_dtb = NULL;
@@ -156,6 +162,8 @@ static struct option options[] = {
 #ifdef RVFI_DII
     {"rvfi-dii",                    required_argument, 0, 'r'                     },
     {"instr-file",                  required_argument, 0, 'f'                     },
+    {"rvfi-output",                 required_argument, 0, OPT_RVFI_OUTPUT         },
+    {"elf-output",                  required_argument, 0, OPT_ELF_OUTPUT          },
 #endif
     {"help",                        no_argument,       0, 'h'                     },
     {"trace",                       optional_argument, 0, 'v'                     },
@@ -178,6 +186,9 @@ static void print_usage(const char *argv0, int ec)
 #ifdef RVFI_DII
   fprintf(stdout, "       %s [options] -r <port>\n", argv0);
   fprintf(stdout, "       %s [options] -f <instr_file>\n", argv0);
+  fprintf(stdout,
+          "   --rvfi-output <file>  write binary RVFI trace to file (file mode)\n"
+          "   --elf-output  <file>  write ELF memory dump to file (file mode)\n");
 #endif
   struct option *opt = options;
   while (opt->name) {
@@ -409,6 +420,14 @@ static int process_args(int argc, char **argv)
       rvfi_file_mode = true;
       instr_file_path = strdup(optarg);
       fprintf(stderr, "using %s for instruction input.\n", instr_file_path);
+      break;
+    case OPT_RVFI_OUTPUT:
+      rvfi_output_path = strdup(optarg);
+      fprintf(stderr, "writing RVFI trace to %s\n", rvfi_output_path);
+      break;
+    case OPT_ELF_OUTPUT:
+      elf_output_path = strdup(optarg);
+      fprintf(stderr, "writing ELF memory dump to %s\n", elf_output_path);
       break;
 #endif
     case 'V':
@@ -843,9 +862,19 @@ static size_t    instr_buffer_pos  = 0;
 
 /*
  * Read instructions from a text file into instr_buffer.
- * Each line is scanned for the first "0x" token; lines without one
- * are skipped (comments, labels, blank lines, etc.).
- * This means test.S files like ".4byte 0x47018113 # comment" work directly.
+ *
+ * Parsing rules:
+ *   - '#' begins a comment; everything from '#' to end-of-line is ignored.
+ *   - After stripping the comment, the remaining text is scanned for the
+ *     first "0x" token.  If found, that hex value is taken as the instruction.
+ *   - Lines with no "0x" token (blank, pure-comment, label-only) are skipped.
+ *
+ * This means all of the following formats work correctly:
+ *   0x47018113            <- bare hex
+ *   0x47018113  # addi    <- hex with trailing comment
+ *   .4byte 0x47018113     <- assembler directive
+ *   # this whole line is a comment
+ *   #0x34109073           <- entire line commented out — skipped, not parsed
  */
 static void read_instr_file(const char *path)
 {
@@ -863,6 +892,11 @@ static void read_instr_file(const char *path)
     exit(1);
   }
   while (fgets(line, sizeof(line), f)) {
+    /* Strip comment: terminate the string at the first '#'. */
+    char *comment = strchr(line, '#');
+    if (comment)
+      *comment = '\0';
+    /* Now look for a hex literal in what remains. */
     char *hex_start = strstr(line, "0x");
     if (!hex_start)
       continue;
@@ -941,8 +975,23 @@ void run_sail(void)
   int insn_cnt = 0;
 #ifdef RVFI_DII
   bool need_instr = true;
+  /* File descriptor used for RVFI trace output in file mode.
+   * We assign it to rvfi_dii_sock so that rvfi_send_trace() writes to the
+   * file without any other changes to the existing packet-sending logic. */
+  int rvfi_trace_fd = -1;
   if (rvfi_file_mode) {
     read_instr_file(instr_file_path);
+    if (rvfi_output_path != NULL) {
+      rvfi_trace_fd = open(rvfi_output_path,
+                           O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (rvfi_trace_fd < 0) {
+        fprintf(stderr, "Cannot open RVFI output file '%s': %s\n",
+                rvfi_output_path, strerror(errno));
+        exit(1);
+      }
+      /* Redirect rvfi_send_trace() output to the file. */
+      rvfi_dii_sock = rvfi_trace_fd;
+    }
   }
 #endif
 
@@ -984,18 +1033,36 @@ void run_sail(void)
           goto step_exception;
         flush_logs();
         KILL(sail_int)(&sail_step);
+        /* Emit RVFI execution trace packet for this instruction, if a trace
+         * output file was requested via --rvfi-output. */
+        if (rvfi_trace_fd >= 0)
+          rvfi_send_trace(rvfi_trace_version);
       } else {
-        /* All instructions consumed: dump the settled post-execution memory
-         * state to an ELF executable.  This is necessary because jump/branch/
-         * store instructions may have modified the instruction stream in RAM,
-         * making the original instruction file inconsistent with what was
-         * actually executed.  The dumped ELF captures the exact memory state
-         * and sets the entry point to rv_ram_base so it can be reloaded and
-         * re-executed for a fully consistent, reproducible run. */
-        static uint64_t file_run_count = 0;
-        char dump_filename[256];
-        snprintf(dump_filename, sizeof(dump_filename),
-                 "memdump_%06" PRIu64 ".elf", file_run_count++);
+        /* All instructions consumed.
+         * 1. Send a halt packet so the trace file is self-contained and can
+         *    be compared directly with an RTL trace (which also ends with a
+         *    halt entry).
+         * 2. Close the trace file before dumping the ELF.
+         * 3. Dump the settled post-execution memory state to an ELF so it
+         *    can be reloaded and re-executed for a reproducible second pass. */
+        if (rvfi_trace_fd >= 0) {
+          zrvfi_halt_exec_packet(UNIT);
+          rvfi_send_trace(rvfi_trace_version);
+          close(rvfi_trace_fd);
+          rvfi_trace_fd = -1;
+          fprintf(stderr, "RVFI trace written to %s\n", rvfi_output_path);
+        }
+        /* Choose ELF output filename: explicit path, or auto-generated. */
+        char auto_dump_filename[256];
+        const char *dump_filename;
+        if (elf_output_path != NULL) {
+          dump_filename = elf_output_path;
+        } else {
+          static uint64_t file_run_count = 0;
+          snprintf(auto_dump_filename, sizeof(auto_dump_filename),
+                   "memdump_%06" PRIu64 ".elf", file_run_count++);
+          dump_filename = auto_dump_filename;
+        }
         mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size, rv_ram_base, (int)zxlen_val);
         fprintf(stderr, "Memory dumped to %s\n", dump_filename);
         break;
@@ -1226,7 +1293,14 @@ dump_state:
   finish(diverged | zhtif_exit_code);
 
 step_exception:
-  fprintf(stderr, "Sail exception!");
+  fprintf(stderr, "Sail exception!\n");
+#ifdef RVFI_DII
+  /* Close the RVFI trace file on exception so it isn't left half-written. */
+  if (rvfi_trace_fd >= 0) {
+    close(rvfi_trace_fd);
+    rvfi_trace_fd = -1;
+  }
+#endif
   goto dump_state;
 }
 
