@@ -981,17 +981,25 @@ void run_sail(void)
   int rvfi_trace_fd = -1;
   if (rvfi_file_mode) {
     read_instr_file(instr_file_path);
-    if (rvfi_output_path != NULL) {
-      rvfi_trace_fd = open(rvfi_output_path,
-                           O_WRONLY | O_CREAT | O_TRUNC, 0644);
-      if (rvfi_trace_fd < 0) {
-        fprintf(stderr, "Cannot open RVFI output file '%s': %s\n",
-                rvfi_output_path, strerror(errno));
-        exit(1);
-      }
-      /* Redirect rvfi_send_trace() output to the file. */
-      rvfi_dii_sock = rvfi_trace_fd;
+  }
+  /* Open the RVFI trace file for any mode that has --rvfi-output set:
+   *   - Phase 1 `-f` instruction-file mode (rvfi_file_mode=true,
+   *     and rvfi_dii is also set to true by the `-f` handler at line
+   *     419 — file mode is treated as a sub-case of DII upstream).
+   *   - Phase 2 ELF re-exec (rvfi_dii=false, rvfi_file_mode=false).
+   * The only mode we must NOT redirect is pure socket DII
+   * (rvfi_dii=true, rvfi_file_mode=false), where rvfi_dii_sock is the
+   * live network socket. */
+  if (rvfi_output_path != NULL && (rvfi_file_mode || !rvfi_dii)) {
+    rvfi_trace_fd = open(rvfi_output_path,
+                         O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (rvfi_trace_fd < 0) {
+      fprintf(stderr, "Cannot open RVFI output file '%s': %s\n",
+              rvfi_output_path, strerror(errno));
+      exit(1);
     }
+    /* Redirect rvfi_send_trace() output to the file. */
+    rvfi_dii_sock = rvfi_trace_fd;
   }
 #endif
 
@@ -1212,6 +1220,16 @@ void run_sail(void)
           fprintf(stderr,
                   "[re-exec] zero instruction at PC 0x%" PRIx64 " – stopping.\n",
                   pc);
+          /* Match Phase 1's behaviour: emit a final halt packet so the
+           * Phase-2 RVFI trace ends with a known sentinel and is directly
+           * comparable to an RTL trace. */
+          if (rvfi_trace_fd >= 0) {
+            zrvfi_halt_exec_packet(UNIT);
+            rvfi_send_trace(rvfi_trace_version);
+            close(rvfi_trace_fd);
+            rvfi_trace_fd = -1;
+            fprintf(stderr, "RVFI trace written to %s\n", rvfi_output_path);
+          }
           break;
         }
         zrvfi_set_instr_packet(instr);
@@ -1226,6 +1244,14 @@ void run_sail(void)
         goto step_exception;
       flush_logs();
       KILL(sail_int)(&sail_step);
+#ifdef RVFI_DII
+      /* Phase 2 ELF re-exec: emit one RVFI exec packet per stepped
+       * instruction so --rvfi-output produces the same binary stream
+       * Phase 1 does, just sourced from physical memory instead of the
+       * instruction-file buffer. */
+      if (rvfi_trace_fd >= 0)
+        rvfi_send_trace(rvfi_trace_version);
+#endif
     }
     if (stepped) {
       step_no++;
@@ -1285,6 +1311,20 @@ void run_sail(void)
       tick_spike();
     }
   }
+
+#ifdef RVFI_DII
+  /* Safety net for loop exits that don't go through one of the
+   * mode-specific close paths (insn_limit reached, zhtif_done, divergence,
+   * etc.). Phase 1's rvfi_file_mode block already closes its own fd and
+   * sets it to -1, so this is a no-op there. */
+  if (rvfi_trace_fd >= 0) {
+    zrvfi_halt_exec_packet(UNIT);
+    rvfi_send_trace(rvfi_trace_version);
+    close(rvfi_trace_fd);
+    rvfi_trace_fd = -1;
+    fprintf(stderr, "RVFI trace written to %s\n", rvfi_output_path);
+  }
+#endif
 
 dump_state:
   if (diverged) {
