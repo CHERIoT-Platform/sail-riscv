@@ -1396,9 +1396,9 @@ int main(int argc, char **argv)
 #ifdef RVFI_DII
   uint64_t entry;
   if (rvfi_file_mode) {
-    entry = 0x80000000;
+    entry = 0x80000080;
   } else if (rvfi_dii) {
-    entry = 0x80000000;
+    entry = 0x80000080;
     int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_sock == -1) {
       fprintf(stderr, "Unable to create socket: %s\n", strerror(errno));
