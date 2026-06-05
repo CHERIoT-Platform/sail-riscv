@@ -59,6 +59,18 @@ const char *RV32ISA = "RV32IMAC";
 #define OPT_RVFI_OUTPUT 1004
 #define OPT_ELF_OUTPUT  1005
 
+/* Reset PC for RVFI builds. Bumped from 0x80000000 to 0x80000080 to
+ * match the Ibex / Kudu RTL reset vector. Used in two places that
+ * must agree:
+ *   1. main() initialises `entry` (the local var passed to
+ *      init_sail() which sets zPC) to this value.
+ *   2. mem_dump_elf() writes this as the ELF header's e_entry so
+ *      Phase-2 re-execution (load_sail -> zPC = elf_entry) lands on
+ *      the same instruction Phase 1 started at. Using rv_ram_base
+ *      (0x80000000) instead would leave a 128-byte hole at the entry,
+ *      and Phase 2 would terminate at the very first instr==0 fetch. */
+#define RVFI_RESET_PC UINT64_C(0x80000080)
+
 static bool do_dump_dts = false;
 static bool do_show_times = false;
 struct tv_spike_t *s = NULL;
@@ -1071,7 +1083,12 @@ void run_sail(void)
                    "memdump_%06" PRIu64 ".elf", file_run_count++);
           dump_filename = auto_dump_filename;
         }
-        mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size, rv_ram_base, (int)zxlen_val);
+        /* entry_point = RVFI_RESET_PC (NOT rv_ram_base): Phase 1 began
+         * fetching at 0x80000080 so the live PT_LOAD segment starts
+         * there; e_entry must match or Phase 2 re-execution would set
+         * zPC = 0x80000000 and immediately hit instr==0 in the
+         * unmapped 128-byte gap. */
+        mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size, RVFI_RESET_PC, (int)zxlen_val);
         fprintf(stderr, "Memory dumped to %s\n", dump_filename);
         break;
       }
@@ -1129,12 +1146,12 @@ void run_sail(void)
            * self-modifications from jump/branch/store instructions) so it
            * can be reloaded and re-executed for a consistent, reproducible
            * second-pass RVFI execution.  The entry point is set to
-           * rv_ram_base so the loader knows where to begin execution. */
+           * RVFI_RESET_PC so re-execution begins where Phase 1 did. */
           static uint64_t dii_trace_count = 0;
           char dump_filename[256];
           snprintf(dump_filename, sizeof(dump_filename),
                    "memdump_%06" PRIu64 ".elf", dii_trace_count++);
-          mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size, rv_ram_base, (int)zxlen_val);
+          mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size, RVFI_RESET_PC, (int)zxlen_val);
           return;
         }
       }
@@ -1396,9 +1413,9 @@ int main(int argc, char **argv)
 #ifdef RVFI_DII
   uint64_t entry;
   if (rvfi_file_mode) {
-    entry = 0x80000080;
+    entry = RVFI_RESET_PC;
   } else if (rvfi_dii) {
-    entry = 0x80000080;
+    entry = RVFI_RESET_PC;
     int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_sock == -1) {
       fprintf(stderr, "Unable to create socket: %s\n", strerror(errno));
