@@ -32,6 +32,13 @@ register x13 : regtype
 register x14 : regtype
 register x15 : regtype
 
+// Forward declaration: rvfi_rX is the RVFI source-register hook,
+// called from rX below. The actual body comes after rX (inside the
+// $ifdef RVFI_DII block alongside rvfi_wX) to keep the two RVFI
+// hooks together. The val declaration here is enough to make the
+// callee visible to the rX function above.
+val rvfi_rX : forall 'n, 0 <= 'n < 32. (regno('n), xlenbits) -> unit
+
 val rX : forall 'n, 0 <= 'n < 32. regno('n) -> xlenbits
 function rX r = {
   let v : regtype =
@@ -54,7 +61,12 @@ function rX r = {
       15 => x15,
       _  => throw Error_not_rv32e_register()
     };
-  regval_from_reg(v)
+  let xval = regval_from_reg(v);
+  // Populate the RVFI source-register slots so the exec packet
+  // records which register was read and the value returned. This is
+  // a no-op in non-RVFI builds (see the $else stub below).
+  rvfi_rX(r, xval);
+  xval
 }
 
 $ifdef RVFI_DII
@@ -64,9 +76,38 @@ function rvfi_wX (r,v) = {
   rvfi_int_data[rvfi_rd_addr] = to_bits(8,r);
   rvfi_int_data_present = true;
 }
+
+// Read-side analogue of rvfi_wX. Fills the rs1 slot on the first call
+// of each step, the rs2 slot on the second, and drops further calls
+// on the floor. The slot counter is reset by rvfi_zero_exec_packet().
+//
+// All instructions read their source registers via rX before doing
+// anything else (Sail's wX path can't be reached without first
+// computing the input value), so the first two slots reliably end
+// up holding the instruction's actual rs1 / rs2.
+// (val rvfi_rX is forward-declared near the top of the file so rX can call it.)
+function rvfi_rX (r, v) = {
+  match rvfi_int_read_slot {
+    0b00 => {
+      rvfi_int_data[rvfi_rs1_addr]  = to_bits(8, r);
+      rvfi_int_data[rvfi_rs1_rdata] = zero_extend(v);
+      rvfi_int_read_slot = 0b01;
+      rvfi_int_data_present = true;
+    },
+    0b01 => {
+      rvfi_int_data[rvfi_rs2_addr]  = to_bits(8, r);
+      rvfi_int_data[rvfi_rs2_rdata] = zero_extend(v);
+      rvfi_int_read_slot = 0b10;
+      rvfi_int_data_present = true;
+    },
+    _ => ()  // both slots already filled; ignore extra reads
+  }
+}
 $else
 val rvfi_wX : forall 'n, 0 <= 'n < 32. (regno('n), xlenbits) -> unit
 function rvfi_wX (r,v) = ()
+// rvfi_rX val is forward-declared at the top of the file; body here.
+function rvfi_rX (r, v) = ()
 $endif
 
 val wX : forall 'n, 0 <= 'n < 32. (regno('n), xlenbits) -> unit

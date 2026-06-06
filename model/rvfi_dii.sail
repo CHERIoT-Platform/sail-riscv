@@ -198,6 +198,13 @@ register rvfi_int_data_present : bool
 register rvfi_mem_data : RVFI_DII_Execution_Packet_Ext_MemAccess
 register rvfi_mem_data_present : bool
 
+// Tracks which RVFI source-register slot the next rX call should fill.
+// Reset to 0 at the start of every step (in rvfi_zero_exec_packet).
+//   0b00  next rX read populates rs1
+//   0b01  next rX read populates rs2
+//   0b10  both slots already filled — drop further reads on the floor
+register rvfi_int_read_slot : bits(2)
+
 // Reset the trace
 val rvfi_zero_exec_packet : unit -> unit
 
@@ -212,6 +219,9 @@ function rvfi_zero_exec_packet () = {
   // magic = "mem-data" -> 0x617461642d6d656d (big-endian)
   rvfi_mem_data = update_magic(rvfi_mem_data, 0x617461642d6d656d);
   rvfi_mem_data_present = false;
+  // Reset the source-register read slot so the first two rX calls in
+  // this step land in rs1_{addr,rdata} and rs2_{addr,rdata}.
+  rvfi_int_read_slot = 0b00;
 }
 
 // FIXME: most of these will no longer be necessary once we use the c2 sail backend.
