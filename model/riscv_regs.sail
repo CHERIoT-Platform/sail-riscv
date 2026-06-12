@@ -38,6 +38,8 @@ register x15 : regtype
 // hooks together. The val declaration here is enough to make the
 // callee visible to the rX function above.
 val rvfi_rX : forall 'n, 0 <= 'n < 32. (regno('n), xlenbits) -> unit
+val rvfi_rX64 : forall 'n 'm, 0 <= 'n < 32 & 64 <= 'm. (regno('n), bits('m)) -> unit
+val rvfi_wX64 : forall 'n 'm, 0 <= 'n < 32 & 64 <= 'm. (regno('n), bits('m)) -> unit
 
 val rX : forall 'n, 0 <= 'n < 32. regno('n) -> xlenbits
 function rX r = {
@@ -77,6 +79,13 @@ function rvfi_wX (r,v) = {
   rvfi_int_data_present = true;
 }
 
+function rvfi_wX64 (r, v) = {
+  let v64 : bits(64) = truncate(v, 64); 
+  rvfi_int_data[rvfi_rd_wdata] = v64;
+  rvfi_int_data[rvfi_rd_addr] = to_bits(8,r);
+  rvfi_int_data_present = true;
+}
+
 // Read-side analogue of rvfi_wX. Fills the rs1 slot on the first call
 // of each step, the rs2 slot on the second, and drops further calls
 // on the floor. The slot counter is reset by rvfi_zero_exec_packet().
@@ -103,11 +112,34 @@ function rvfi_rX (r, v) = {
     _ => ()  // both slots already filled; ignore extra reads
   }
 }
+
+function rvfi_rX64 (r, v) = {
+  let v64 : bits(64) = truncate(v, 64); 
+
+  match rvfi_int_read_slot {
+    0b00 => {
+      rvfi_int_data[rvfi_rs1_addr] = to_bits(8, r);
+      rvfi_int_data[rvfi_rs1_rdata] = v64;
+      rvfi_int_read_slot = 0b01;
+      rvfi_int_data_present = true;
+    },
+    0b01 => {
+      rvfi_int_data[rvfi_rs2_addr] = to_bits(8, r);
+      rvfi_int_data[rvfi_rs2_rdata] = v64;
+      rvfi_int_read_slot = 0b10;
+      rvfi_int_data_present = true;
+    },
+    _ => ()
+  }
+}
+
 $else
 val rvfi_wX : forall 'n, 0 <= 'n < 32. (regno('n), xlenbits) -> unit
 function rvfi_wX (r,v) = ()
+function rvfi_wX64 (r,v) = ()
 // rvfi_rX val is forward-declared at the top of the file; body here.
 function rvfi_rX (r, v) = ()
+function rvfi_rX64 (r, v) = ()
 $endif
 
 val wX : forall 'n, 0 <= 'n < 32. (regno('n), xlenbits) -> unit
