@@ -67,6 +67,16 @@ function phys_mem_read forall 'n, 0 < 'n <= max_mem_access . (t : AccessType(ext
 }
 
 /* dispatches to MMIO regions or physical memory regions depending on physical memory map */
+$ifdef RVFI_DII
+function checked_mem_read forall 'n, 0 < 'n <= max_mem_access .
+  (t : AccessType(ext_access_type), paddr : xlenbits, width : atom('n),
+   aq : bool, rl : bool, res: bool, meta : bool)
+  -> MemoryOpResult((bits(8 * 'n), mem_meta)) =
+  match ext_check_phys_mem_read(t, paddr, width, aq, rl, res, meta) {
+    Ext_PhysAddr_OK() => phys_mem_read(t, paddr, width, aq, rl, res, meta),
+    Ext_PhysAddr_Error(e) => MemException(e)
+  }
+$else
 function checked_mem_read forall 'n, 0 < 'n <= max_mem_access . (t : AccessType(ext_access_type), paddr : xlenbits, width : atom('n), aq : bool, rl : bool, res: bool, meta : bool) -> MemoryOpResult((bits(8 * 'n), mem_meta)) =
   if   within_mmio_readable(paddr, width)
   then MemoryOpResult_add_meta(mmio_read(t, paddr, width), default_meta)
@@ -79,6 +89,7 @@ function checked_mem_read forall 'n, 0 < 'n <= max_mem_access . (t : AccessType(
     Read(Data) => MemException(E_Load_Access_Fault()),
     _          => MemException(E_SAMO_Access_Fault())
   }
+$endif
 
 /* PMP checks if enabled */
 function pmp_mem_read forall 'n, 0 < 'n <= max_mem_access . (t : AccessType(ext_access_type), p : Privilege, paddr : xlenbits, width : atom('n), aq : bool, rl : bool, res: bool, meta : bool) -> MemoryOpResult((bits(8 * 'n), mem_meta)) =
@@ -233,6 +244,15 @@ function phys_mem_write forall 'n, 0 < 'n <= max_mem_access . (wk : write_kind, 
 }
 
 /* dispatches to MMIO regions or physical memory regions depending on physical memory map */
+$ifdef RVFI_DII
+function checked_mem_write forall 'n, 0 < 'n <= max_mem_access .
+  (wk : write_kind, paddr : xlenbits, width : atom('n),
+   data: bits(8 * 'n), meta: mem_meta) -> MemoryOpResult(bool) =
+  match ext_check_phys_mem_write(wk, paddr, width, data, meta) {
+    Ext_PhysAddr_OK() => phys_mem_write(wk, paddr, width, data, meta),
+    Ext_PhysAddr_Error(e) => MemException(e)
+  }
+$else
 function checked_mem_write forall 'n, 0 < 'n <= max_mem_access . (wk : write_kind, paddr : xlenbits, width : atom('n), data: bits(8 * 'n), meta: mem_meta) -> MemoryOpResult(bool) =
   if   within_mmio_writable(paddr, width)
   then mmio_write(paddr, width, data)
@@ -242,6 +262,7 @@ function checked_mem_write forall 'n, 0 < 'n <= max_mem_access . (wk : write_kin
     Ext_PhysAddr_Error(e)  => MemException(e)
   }
   else MemException(E_SAMO_Access_Fault())
+$endif
 
 /* PMP checks if enabled */
 function pmp_mem_write forall 'n, 0 < 'n <= max_mem_access . (wk: write_kind, paddr : xlenbits, width : atom('n), data: bits(8 * 'n), typ: AccessType(ext_access_type), priv: Privilege, meta: mem_meta) -> MemoryOpResult(bool) =
