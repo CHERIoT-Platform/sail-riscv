@@ -155,8 +155,9 @@ GMP_FLAGS = $(shell pkg-config --cflags gmp)
 GMP_LIBS = $(shell pkg-config --libs gmp || echo -lgmp)
 ZLIB_FLAGS = $(shell pkg-config --cflags zlib)
 ZLIB_LIBS = $(shell pkg-config --libs zlib)
+ELFIO_DIR ?= /opt/elfio
 
-C_FLAGS = -I $(SAIL_LIB_DIR) -I c_emulator $(GMP_FLAGS) $(ZLIB_FLAGS) $(SOFTFLOAT_FLAGS)
+C_FLAGS = -I $(SAIL_LIB_DIR) -I c_emulator -I $(ELFIO_DIR) $(GMP_FLAGS) $(ZLIB_FLAGS) $(SOFTFLOAT_FLAGS)
 C_LIBS  = $(GMP_LIBS) $(ZLIB_LIBS) $(SOFTFLOAT_LIBS)
 
 # The C simulator can be built to be linked against Spike for tandem-verification.
@@ -268,6 +269,16 @@ osim: ocaml_emulator/riscv_ocaml_sim_$(ARCH)
 .PHONY: rvfi
 rvfi: c_emulator/riscv_rvfi_$(ARCH)
 
+c_emulator/mem_support.o: \
+		c_emulator/mem_dump.cpp \
+		c_emulator/mem_dump.h \
+		c_emulator/mem.cpp
+	g++ -g $(C_FLAGS) \
+		-r \
+		c_emulator/mem_dump.cpp \
+		c_emulator/mem.cpp \
+		-o $@
+
 c_emulator/riscv_sim_$(ARCH): generated_definitions/c/riscv_model_$(ARCH).c $(C_INCS) $(C_SRCS) $(SOFTFLOAT_LIBS) Makefile
 	gcc -g $(C_WARNINGS) $(C_FLAGS) $< $(C_SRCS) $(SAIL_LIB_DIR)/*.c $(C_LIBS) -o $@
 
@@ -294,8 +305,8 @@ generated_definitions/c/riscv_rvfi_model_$(ARCH).c: $(SAIL_RVFI_SRCS) model/main
 	sed -e '/^[[:space:]]*$$/d' $@ > $@.new
 	mv $@.new $@
 
-c_emulator/riscv_rvfi_$(ARCH): generated_definitions/c/riscv_rvfi_model_$(ARCH).c $(C_INCS) $(C_SRCS) c_emulator/mem_dump.c c_emulator/mem_dump.h $(SOFTFLOAT_LIBS) Makefile
-	gcc -g $(C_WARNINGS) $(C_FLAGS) $< -DRVFI_DII $(C_SRCS) c_emulator/mem_dump.c $(SAIL_LIB_DIR)/*.c $(C_LIBS) -o $@
+c_emulator/riscv_rvfi_$(ARCH): generated_definitions/c/riscv_rvfi_model_$(ARCH).c $(C_INCS) $(C_SRCS) c_emulator/mem_support.o c_emulator/mem_dump.h $(SOFTFLOAT_LIBS) Makefile
+	gcc -g $(C_WARNINGS) $(C_FLAGS) $< -DRVFI_DII $(C_SRCS) c_emulator/mem_support.o $(SAIL_LIB_DIR)/*.c $(C_LIBS)  -lstdc++  -o $@
 
 latex: $(SAIL_SRCS) Makefile
 	mkdir -p generated_definitions/latex

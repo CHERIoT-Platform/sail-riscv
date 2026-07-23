@@ -118,6 +118,25 @@ true
 #endif
 ;
 
+static void initialize_empty_halfwords(void)
+{
+    const uint64_t base = UINT64_C(0x80000100);
+
+    for (unsigned i = 0; i < 64; i++) {
+        uint64_t addr = base + ((uint64_t)i * UINT64_C(0x100));
+
+        uint16_t value =
+            ((uint16_t)(uint8_t)read_mem(addr)) |
+            ((uint16_t)(uint8_t)read_mem(addr + 1) << 8);
+
+        if (value == UINT16_C(0x0000)) {
+            /* Little-endian encoding of 0xb701 (c.j -256)  */
+            write_mem(addr,     UINT8_C(0x01));
+            write_mem(addr + 1, UINT8_C(0xb7));
+        }
+    }
+}
+
 void set_config_print(char *var, bool val)
 {
   if (var == NULL || strcmp("all", var) == 0) {
@@ -974,6 +993,88 @@ void rvfi_send_trace(unsigned version)
   }
 }
 
+#ifdef CHERIOT_MODE
+
+/* RVFI v1 packet field rvfi_trap occupies bits [727:720]. */
+static bool rvfi_v1_trapped(void)
+{
+  lbits packet;
+  bool trapped = false;
+
+  CREATE(lbits)(&packet);
+  zrvfi_get_exec_packet_v1(&packet, UNIT);
+
+  for (mp_bitcnt_t bit = 720; bit <= 727; bit++) {
+    if (mpz_tstbit(*(packet.bits), bit)) {
+      trapped = true;
+      break;
+    }
+  }
+
+  KILL(lbits)(&packet);
+  return trapped;
+}
+
+#define INSN_CSPECIALR_CA5_MEPCC UINT32_C(0x03f007db)
+#define INSN_CINCOFFSET_CA5_2    UINT32_C(0x002797db)
+#define INSN_CINCOFFSET_CA5_4    UINT32_C(0x004797db)
+#define INSN_CSPECIALW_MEPCC_CA5 UINT32_C(0x03f7805b)
+#define INSN_MRET                UINT32_C(0x30200073)
+
+static bool insert_cheriot_trap_handler(uint32_t trapped_instr,
+                                        mach_int *step_no,
+                                        int *insn_cnt,
+                                        int rvfi_trace_fd)
+{
+  const uint32_t handler[] = {
+    INSN_CSPECIALR_CA5_MEPCC,
+    ((trapped_instr & 0x3U) == 0x3U)
+        ? INSN_CINCOFFSET_CA5_4
+        : INSN_CINCOFFSET_CA5_2,
+    INSN_CSPECIALW_MEPCC_CA5,
+    INSN_MRET
+  };
+
+  uint64_t pc = 0x807f0000;
+  for (size_t i = 0; i < sizeof(handler) / sizeof(handler[0]); i++) {
+    uint32_t instr = handler[i];
+
+    /* All trap-handler instructions are 32-bit. */
+    for (uint32_t b = 0; b < 4; b++)
+      write_mem(pc + b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+    pc += 4;
+
+    zrvfi_set_instr_packet(instr);
+    zrvfi_zzero_exec_packet(UNIT);
+
+    sail_int sail_step;
+    CREATE(sail_int)(&sail_step);
+    (*step_no)++;
+    CONVERT_OF(sail_int, mach_int)(&sail_step, *step_no);
+    bool handler_stepped = zstep(sail_step);
+
+    if (have_exception) {
+      KILL(sail_int)(&sail_step);
+      return false;
+    }
+
+    flush_logs();
+    KILL(sail_int)(&sail_step);
+
+    if (rvfi_trace_fd >= 0)
+      rvfi_send_trace(rvfi_trace_version);
+
+    if (handler_stepped) {
+      (*insn_cnt)++;
+      total_insns++;
+    }
+  }
+
+  return true;
+}
+
+#endif /* CHERIOT_MODE */
+
 #endif
 
 void run_sail(void)
@@ -1057,6 +1158,14 @@ void run_sail(void)
          * output file was requested via --rvfi-output. */
         if (rvfi_trace_fd >= 0)
           rvfi_send_trace(rvfi_trace_version);
+
+#ifdef CHERIOT_MODE
+        if (rvfi_v1_trapped()) {
+          if (!insert_cheriot_trap_handler(instr, &step_no, &insn_cnt,
+                                           rvfi_trace_fd))
+            goto step_exception;
+        }
+#endif
       } else {
         /* All instructions consumed.
          * 1. Send a halt packet so the trace file is self-contained and can
@@ -1088,6 +1197,9 @@ void run_sail(void)
          * there; e_entry must match or Phase 2 re-execution would set
          * zPC = 0x80000000 and immediately hit instr==0 in the
          * unmapped 128-byte gap. */
+
+        // initialize_empty_halfwords();
+
         mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size, RVFI_RESET_PC, (int)zxlen_val);
         fprintf(stderr, "Memory dumped to %s\n", dump_filename);
         break;
@@ -1233,7 +1345,8 @@ void run_sail(void)
          * exception handler runs at address 0x0 (the RISC-V default mtvec).
          * All-zero (0x00000000) is never a valid RISC-V instruction, so it
          * is a safe and portable end-of-program sentinel. */
-        if (instr == 0) {
+        /*if (instr == 0) { */
+        if (0) {
           fprintf(stderr,
                   "[re-exec] zero instruction at PC 0x%" PRIx64 " – stopping.\n",
                   pc);
