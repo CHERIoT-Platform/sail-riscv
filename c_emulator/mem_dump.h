@@ -1,44 +1,36 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
-
-/*
- * Write the post-execution simulator memory state to an ELF executable file.
- *
- * Based on the memory dump approach from riscv/sail-riscv PR#1549.
- *
- * After all instructions have been executed (including any self-modifications
- * caused by jump/branch/store instructions), this function writes the settled
- * memory contents to an ELF file that can be reloaded and re-executed to
- * reproduce a consistent memory view.
- *
- * The ELF class (32-bit / 64-bit) is chosen to match `xlen` so that the
- * produced file is accepted by both the RV32 and RV64 simulator builds:
- *   xlen == 32  ->  ELFCLASS32 (ELF32 headers, 32-bit addresses)
- *   xlen == 64  ->  ELFCLASS64 (ELF64 headers, 64-bit addresses)
- *
- * Only non-zero blocks of RAM are emitted as PT_LOAD segments, keeping the
- * file compact when most of the address space is unused.  The ELF entry
- * point is set to `entry_point` so the loader knows where execution begins.
- *
- * filename    : Output file path (e.g. "memdump_000000.elf").
- * base        : Physical start address of the RAM region to dump.
- * size        : Size of the RAM region in bytes.
- * entry_point : Address at which re-execution should begin (typically
- *               rv_ram_base, i.e. 0x80000000 in RVFI modes).
- * xlen        : Address width in bits – pass (int)zxlen_val (32 or 64).
- *
- * Implemented in mem_dump.cpp (C++ / ELFIO).  The #ifdef __cplusplus guards
- * give this declaration C linkage when included from C++ translation units,
- * matching the extern "C" definition in mem_dump.cpp.
- */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-void mem_dump_elf(const char *filename, uint64_t base, uint64_t size,
-                  uint64_t entry_point, int xlen);
+/*
+ * Return true when at least one byte in
+ * [start_addr, start_addr + length) has previously been written.
+ *
+ * A zero length always returns false.  A byte explicitly written with value
+ * zero still counts as written.
+ */
+bool test_elf_mem(uint64_t start_addr, uint64_t length);
+
+/* Write one byte to the specified address. */
+void write_elf_mem(uint64_t addr, uint8_t data);
+
+/* Read one byte.  An address that has never been written returns zero. */
+uint8_t read_elf_mem(uint64_t addr);
+
+/*
+ * Dump every byte that has been written to an ELF file.
+ *
+ * Consecutive addresses are combined into one PT_LOAD segment.  Disjoint
+ * address ranges are emitted as separate PT_LOAD segments.
+ *
+ * xlen must be either 32 or 64.  The function returns true on success.
+ */
+bool dump_elf_mem(const char *filename, uint64_t entry_point, int xlen);
 
 #ifdef __cplusplus
 }

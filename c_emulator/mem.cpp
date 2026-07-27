@@ -1,119 +1,51 @@
 /*
- * mem.cpp – first-party sparse memory model implementation.
+ * Byte-based sparse memory used to construct RVFI memory-dump ELFs.
  *
- * Direct C++ port of c_emulator/mem.cpp from riscv/sail-riscv PR#1549
- * ("Add first party memory model with support for memory dumps").
+ * Every entry represents one byte that has explicitly been written:
  *
- * Implements the three non-template methods of class Memory (declared in
- * mem.hpp).  The template method for_each_byte is defined inline in the
- * header because the C++ standard requires template bodies to be visible
- * at instantiation sites.
+ *   address -> byte
+ *
+ * Written zero bytes are retained, so test_elf_mem() distinguishes an
+ * unwritten address from an address explicitly written with zero.
  */
 
-#include "mem.hpp"
+#include "mem_dump.h"
 
-#include <algorithm>
 #include <cstdint>
+#include <map>
 
-/* -------------------------------------------------------------------------
- * block(block_addr)
- *
- * Return a reference to the data array for the block keyed by block_addr,
- * creating and zero-initialising it if it does not yet exist.
- *
- * Mirrors the private block() accessor in PR#1549 mem.h (lines 86–98):
- *
- *   std::array<uint8_t, BLOCK_SIZE> &block(uint64_t block_addr) {
- *       auto it = m_blocks.find(block_addr);
- *       if (it == m_blocks.end()) {
- *           std::array<uint8_t, BLOCK_SIZE> new_block;
- *           new_block.fill(m_uninitialized_value_func());
- *           auto res = m_blocks.insert({block_addr, new_block});
- *           return res.first->second;
- *       }
- *       return it->second;
- *   }
- * ------------------------------------------------------------------------- */
-std::array<uint8_t, Memory::BLOCK_SIZE> &
-Memory::block(uint64_t block_addr)
+namespace sparse_mem_internal {
+
+using ByteMap = std::map<uint64_t, uint8_t>;
+
+ByteMap byte_store;
+
+} // namespace sparse_mem_internal
+
+extern "C" bool test_elf_mem(uint64_t start_addr, uint64_t length)
 {
-    auto it = m_blocks.find(block_addr);
-    if (it == m_blocks.end()) {
-        std::array<uint8_t, BLOCK_SIZE> new_block;
-        new_block.fill(m_uninitialized_value);
-        auto res = m_blocks.insert({block_addr, new_block});
-        return res.first->second;
-    }
-    return it->second;
+    if (length == 0)
+        return false;
+
+    const auto &memory = sparse_mem_internal::byte_store;
+    const auto it = memory.lower_bound(start_addr);
+
+    /*
+     * lower_bound() guarantees it->first >= start_addr.  Subtraction avoids
+     * overflowing start_addr + length when the range reaches UINT64_MAX.
+     */
+    return it != memory.end() && (it->first - start_addr) < length;
 }
 
-/* -------------------------------------------------------------------------
- * write_bytes – mirrors PR#1549 Memory::write_bytes() (mem.h lines 46–58).
- *
- * PR source (C++ reference):
- *   void write_bytes(uint64_t addr, uint64_t addr_size,
- *                    const uint8_t *data, std::size_t len) {
- *       const uint64_t addr_mask = addr_size >= 64 ? ~0ull
- *                                                  : ~(~0ull << addr_size);
- *       while (len > 0) {
- *           addr = addr & addr_mask;
- *           auto &block_data = block(addr / BLOCK_SIZE);
- *           do {
- *               block_data[addr % BLOCK_SIZE] = *data;
- *               ++addr; ++data; --len;
- *           } while (len > 0 && (addr % BLOCK_SIZE) != 0);
- *       }
- *   }
- * ------------------------------------------------------------------------- */
-void Memory::write_bytes(uint64_t addr, uint64_t addr_size,
-                         const uint8_t *data, std::size_t len)
+extern "C" void write_elf_mem(uint64_t addr, uint8_t data)
 {
-    const uint64_t addr_mask = addr_size >= 64
-                               ? ~UINT64_C(0)
-                               : ~(~UINT64_C(0) << addr_size);
-    while (len > 0) {
-        addr = addr & addr_mask;
-        auto &block_data = block(addr / BLOCK_SIZE);
-        do {
-            block_data[addr % BLOCK_SIZE] = *data;
-            ++addr; ++data; --len;
-        } while (len > 0 && (addr % BLOCK_SIZE) != 0);
-    }
+    sparse_mem_internal::byte_store[addr] = data;
 }
 
-/* -------------------------------------------------------------------------
- * read_bytes – mirrors PR#1549 Memory::read_bytes() (mem.h lines 31–43).
- *
- * PR source (C++ reference):
- *   void read_bytes(uint64_t addr, uint64_t addr_size,
- *                   uint8_t *data, std::size_t len) const {
- *       const uint64_t addr_mask = ...;
- *       while (len > 0) {
- *           addr = addr & addr_mask;
- *           const auto it = m_blocks.find(addr / BLOCK_SIZE);
- *           do {
- *               *data = (it != m_blocks.end())
- *                       ? it->second[addr % BLOCK_SIZE]
- *                       : m_uninitialized_value;
- *               ++addr; ++data; --len;
- *           } while (len > 0 && (addr % BLOCK_SIZE) != 0);
- *       }
- *   }
- * ------------------------------------------------------------------------- */
-void Memory::read_bytes(uint64_t addr, uint64_t addr_size,
-                        uint8_t *data, std::size_t len) const
+extern "C" uint8_t read_elf_mem(uint64_t addr)
 {
-    const uint64_t addr_mask = addr_size >= 64
-                               ? ~UINT64_C(0)
-                               : ~(~UINT64_C(0) << addr_size);
-    while (len > 0) {
-        addr = addr & addr_mask;
-        const auto it = m_blocks.find(addr / BLOCK_SIZE);
-        do {
-            *data = (it != m_blocks.end())
-                    ? it->second[addr % BLOCK_SIZE]
-                    : m_uninitialized_value;
-            ++addr; ++data; --len;
-        } while (len > 0 && (addr % BLOCK_SIZE) != 0);
-    }
+    const auto &memory = sparse_mem_internal::byte_store;
+    const auto it = memory.find(addr);
+
+    return it == memory.end() ? UINT8_C(0) : it->second;
 }

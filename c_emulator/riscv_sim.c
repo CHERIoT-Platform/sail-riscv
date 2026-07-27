@@ -132,8 +132,8 @@ static void initialize_empty_halfwords(void)
 
         if (value == UINT16_C(0x0000)) {
             /* Little-endian encoding of 0xb701 (c.j -256)  */
-            write_mem(addr,     UINT8_C(0x01));
-            write_mem(addr + 1, UINT8_C(0xb7));
+            write_elf_mem(addr,     UINT8_C(0x01));
+            write_elf_mem(addr + 1, UINT8_C(0xb7));
         }
     }
 }
@@ -1047,7 +1047,7 @@ static bool insert_cheriot_trap_handler(uint32_t trapped_instr,
 
     /* All trap-handler instructions are 32-bit. */
     for (uint32_t b = 0; b < 4; b++) {
-      write_mem(pc + b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+      write_elf_mem(pc + b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
       //fprintf(instr_write_log, "  write_mem addr=0x%08x data=0x%02x \n", pc+b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
     }
 
@@ -1161,8 +1161,10 @@ void run_sail(void)
           uint64_t pc        = zPC;
           uint32_t instr_len = ((instr & 0x3U) == 0x3U) ? 4U : 2U;
           for (uint32_t b = 0; b < instr_len; b++) {
-            write_mem(pc + b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
-            //fprintf(instr_write_log, "  write_mem addr=0x%08x data=0x%02x \n", pc+b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+            if (!test_elf_mem(pc+b, 1)) {
+              write_elf_mem(pc + b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+              //fprintf(instr_write_log, "  write_mem addr=0x%08x data=0x%02x \n", pc+b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+            }
           }
         }
         zrvfi_set_instr_packet(instr);
@@ -1222,7 +1224,7 @@ void run_sail(void)
         // initialize_empty_halfwords();
         // if (instr_write_log != NULL) 
         //   fclose(instr_write_log);
-        mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size, RVFI_RESET_PC, (int)zxlen_val);
+        dump_elf_mem(dump_filename, RVFI_RESET_PC, (int)zxlen_val);
         fprintf(stderr, "Memory dumped to %s\n", dump_filename);
         break;
       }
@@ -1285,7 +1287,7 @@ void run_sail(void)
           char dump_filename[256];
           snprintf(dump_filename, sizeof(dump_filename),
                    "memdump_%06" PRIu64 ".elf", dii_trace_count++);
-          mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size, RVFI_RESET_PC, (int)zxlen_val);
+          dump_elf_mem(dump_filename,  RVFI_RESET_PC, (int)zxlen_val);
           return;
         }
       }
