@@ -94,6 +94,7 @@ static const char *instr_file_path = NULL;
 static const char *rvfi_output_path = NULL;
 /* Path for ELF memory dump in file mode (NULL = auto-generate name) */
 static const char *elf_output_path  = NULL;
+static FILE *instr_write_log = NULL;
 #endif
 
 unsigned char *spike_dtb = NULL;
@@ -1014,12 +1015,17 @@ static bool rvfi_v1_trapped(void)
   KILL(lbits)(&packet);
   return trapped;
 }
-
-#define INSN_CSPECIALR_CA5_MEPCC UINT32_C(0x03f007db)
-#define INSN_CINCOFFSET_CA5_2    UINT32_C(0x002797db)
+#define INSN_CSPECIALR_CA5_MTCC  UINT32_C(0x03c007db)
+#define INSN_CSPECIALR_CA4_MEPCC UINT32_C(0x03f0075b)
+#define INSN_CSETADDR_CA5_CA5_A4 UINT32_C(0x20e787db)
 #define INSN_CINCOFFSET_CA5_4    UINT32_C(0x004797db)
 #define INSN_CSPECIALW_MEPCC_CA5 UINT32_C(0x03f7805b)
 #define INSN_MRET                UINT32_C(0x30200073)
+
+// #define INSN_CSPECIALR_CA5_MEPCC UINT32_C(0x03f007db)
+//#define INSN_CINCOFFSET_CA5_2    UINT32_C(0x002797db)
+//#define INSN_CINCOFFSET_CA5_4    UINT32_C(0x004797db)
+//#define INSN_CSPECIALW_MEPCC_CA5 UINT32_C(0x03f7805b)
 
 static bool insert_cheriot_trap_handler(uint32_t trapped_instr,
                                         mach_int *step_no,
@@ -1027,12 +1033,12 @@ static bool insert_cheriot_trap_handler(uint32_t trapped_instr,
                                         int rvfi_trace_fd)
 {
   const uint32_t handler[] = {
-    INSN_CSPECIALR_CA5_MEPCC,
-    ((trapped_instr & 0x3U) == 0x3U)
-        ? INSN_CINCOFFSET_CA5_4
-        : INSN_CINCOFFSET_CA5_2,
+    INSN_CSPECIALR_CA5_MTCC,  
+    INSN_CSPECIALR_CA4_MEPCC,
+    INSN_CSETADDR_CA5_CA5_A4,
+    INSN_CINCOFFSET_CA5_4,  
     INSN_CSPECIALW_MEPCC_CA5,
-    INSN_MRET
+    INSN_MRET              
   };
 
   uint64_t pc = 0x807f0000;
@@ -1040,8 +1046,11 @@ static bool insert_cheriot_trap_handler(uint32_t trapped_instr,
     uint32_t instr = handler[i];
 
     /* All trap-handler instructions are 32-bit. */
-    for (uint32_t b = 0; b < 4; b++)
+    for (uint32_t b = 0; b < 4; b++) {
       write_mem(pc + b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+      //fprintf(instr_write_log, "  write_mem addr=0x%08x data=0x%02x \n", pc+b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+    }
+
     pc += 4;
 
     zrvfi_set_instr_packet(instr);
@@ -1088,6 +1097,7 @@ void run_sail(void)
   int insn_cnt = 0;
 #ifdef RVFI_DII
   bool need_instr = true;
+
   /* File descriptor used for RVFI trace output in file mode.
    * We assign it to rvfi_dii_sock so that rvfi_send_trace() writes to the
    * file without any other changes to the existing packet-sending logic. */
@@ -1114,6 +1124,15 @@ void run_sail(void)
     /* Redirect rvfi_send_trace() output to the file. */
     rvfi_dii_sock = rvfi_trace_fd;
   }
+
+  //if (instr_write_log == NULL) {
+  //  instr_write_log = fopen("instr_mem_writes.log", "w");
+  //  if (instr_write_log == NULL) {
+  //    fprintf(stderr, "Failed to open instruction memory log: %s\n",
+  //            strerror(errno));
+  //    exit(1);
+  //  }
+  //}
 #endif
 
   struct timeval interval_start;
@@ -1141,8 +1160,10 @@ void run_sail(void)
         {
           uint64_t pc        = zPC;
           uint32_t instr_len = ((instr & 0x3U) == 0x3U) ? 4U : 2U;
-          for (uint32_t b = 0; b < instr_len; b++)
+          for (uint32_t b = 0; b < instr_len; b++) {
             write_mem(pc + b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+            //fprintf(instr_write_log, "  write_mem addr=0x%08x data=0x%02x \n", pc+b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+          }
         }
         zrvfi_set_instr_packet(instr);
         zrvfi_zzero_exec_packet(UNIT);
@@ -1199,7 +1220,8 @@ void run_sail(void)
          * unmapped 128-byte gap. */
 
         // initialize_empty_halfwords();
-
+        // if (instr_write_log != NULL) 
+        //   fclose(instr_write_log);
         mem_dump_elf(dump_filename, rv_ram_base, rv_ram_size, RVFI_RESET_PC, (int)zxlen_val);
         fprintf(stderr, "Memory dumped to %s\n", dump_filename);
         break;
