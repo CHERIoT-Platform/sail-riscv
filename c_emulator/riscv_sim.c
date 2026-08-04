@@ -994,7 +994,6 @@ void rvfi_send_trace(unsigned version)
   }
 }
 
-#ifdef CHERIOT_MODE
 
 /* RVFI v1 packet field rvfi_trap occupies bits [727:720]. */
 static bool rvfi_v1_trapped(void)
@@ -1022,16 +1021,22 @@ static bool rvfi_v1_trapped(void)
 #define INSN_CSPECIALW_MEPCC_CA5 UINT32_C(0x03f7805b)
 #define INSN_MRET                UINT32_C(0x30200073)
 
+#define INSN_CSRR_A5_MEPC        UINT32_C(0x341027f3)
+#define INSN_ADD_A5_4            UINT32_C(0x00478793)   
+#define INSN_CSRW_MEPC_A5        UINT32_C(0x34179073)
+
+
 // #define INSN_CSPECIALR_CA5_MEPCC UINT32_C(0x03f007db)
 //#define INSN_CINCOFFSET_CA5_2    UINT32_C(0x002797db)
 //#define INSN_CINCOFFSET_CA5_4    UINT32_C(0x004797db)
 //#define INSN_CSPECIALW_MEPCC_CA5 UINT32_C(0x03f7805b)
 
-static bool insert_cheriot_trap_handler(uint32_t trapped_instr,
+static bool insert_trap_handler(uint32_t trapped_instr,
                                         mach_int *step_no,
                                         int *insn_cnt,
                                         int rvfi_trace_fd)
 {
+#ifdef CHERIOT_MODE
   const uint32_t handler[] = {
     INSN_CSPECIALR_CA5_MTCC,  
     INSN_CSPECIALR_CA4_MEPCC,
@@ -1040,6 +1045,15 @@ static bool insert_cheriot_trap_handler(uint32_t trapped_instr,
     INSN_CSPECIALW_MEPCC_CA5,
     INSN_MRET              
   };
+#else
+  const uint32_t handler[] = {
+    INSN_CSRR_A5_MEPC, 
+    INSN_ADD_A5_4,     
+    INSN_CSRW_MEPC_A5, 
+    INSN_MRET              
+  };
+
+#endif
 
   uint64_t pc = 0x807f0000;
   for (size_t i = 0; i < sizeof(handler) / sizeof(handler[0]); i++) {
@@ -1081,8 +1095,6 @@ static bool insert_cheriot_trap_handler(uint32_t trapped_instr,
 
   return true;
 }
-
-#endif /* CHERIOT_MODE */
 
 #endif
 
@@ -1182,13 +1194,11 @@ void run_sail(void)
         if (rvfi_trace_fd >= 0)
           rvfi_send_trace(rvfi_trace_version);
 
-#ifdef CHERIOT_MODE
         if (rvfi_v1_trapped()) {
-          if (!insert_cheriot_trap_handler(instr, &step_no, &insn_cnt,
+          if (!insert_trap_handler(instr, &step_no, &insn_cnt,
                                            rvfi_trace_fd))
             goto step_exception;
         }
-#endif
       } else {
         /* All instructions consumed.
          * 1. Send a halt packet so the trace file is self-contained and can

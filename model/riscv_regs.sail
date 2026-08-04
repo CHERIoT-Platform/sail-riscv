@@ -31,6 +31,22 @@ register x12 : regtype
 register x13 : regtype
 register x14 : regtype
 register x15 : regtype
+register x16 : regtype
+register x17 : regtype
+register x18 : regtype
+register x19 : regtype
+register x20 : regtype
+register x21 : regtype
+register x22 : regtype
+register x23 : regtype
+register x24 : regtype
+register x25 : regtype
+register x26 : regtype
+register x27 : regtype
+register x28 : regtype
+register x29 : regtype
+register x30 : regtype
+register x31 : regtype
 
 // Forward declaration: rvfi_rX is the RVFI source-register hook,
 // called from rX below. The actual body comes after rX (inside the
@@ -43,6 +59,9 @@ val rvfi_wX65 : forall 'n 'm, 0 <= 'n < 32 & 65 <= 'm. (regno('n), bits('m)) -> 
 
 val rX : forall 'n, 0 <= 'n < 32. regno('n) -> xlenbits
 function rX r = {
+  if rv32e_register_file & (r >= 16) then
+    throw Error_not_rv32e_register();
+
   let v : regtype =
     match r {
       0 => zero_reg,
@@ -61,6 +80,23 @@ function rX r = {
       13 => x13,
       14 => x14,
       15 => x15,
+      15 => x15,
+      16 => x16,
+      17 => x17,
+      18 => x18,
+      19 => x19,
+      20 => x20,
+      21 => x21,
+      22 => x22,
+      23 => x23,
+      24 => x24,
+      25 => x25,
+      26 => x26,
+      27 => x27,
+      28 => x28,
+      29 => x29,
+      30 => x30,
+      31 => x31,
       _  => throw Error_not_rv32e_register()
     };
   let xval = regval_from_reg(v);
@@ -146,6 +182,9 @@ $endif
 
 val wX : forall 'n, 0 <= 'n < 32. (regno('n), xlenbits) -> unit
 function wX (r, in_v) = {
+  if rv32e_register_file & (r >= 16) then
+    throw Error_not_rv32e_register();
+
   let v = regval_into_reg(in_v);
   match r {
     0  => (),
@@ -164,6 +203,23 @@ function wX (r, in_v) = {
     13 => x13 = v,
     14 => x14 = v,
     15 => x15 = v,
+    15 => x15 = v,
+    16 => x16 = v,
+    17 => x17 = v,
+    18 => x18 = v,
+    19 => x19 = v,
+    20 => x20 = v,
+    21 => x21 = v,
+    22 => x22 = v,
+    23 => x23 = v,
+    24 => x24 = v,
+    25 => x25 = v,
+    26 => x26 = v,
+    27 => x27 = v,
+    28 => x28 = v,
+    29 => x29 = v,
+    30 => x30 = v,
+    31 => x31 = v,
     _  => throw Error_not_rv32e_register()
   };
   if (r != 0) then {
@@ -289,5 +345,22 @@ function init_base_regs () = {
   x12 = zero_reg;
   x13 = zero_reg;
   x14 = zero_reg;
-  x15 = zero_reg
+  x15 = zero_reg;
+  x15 = zero_reg;
+  x16 = zero_reg;
+  x17 = zero_reg;
+  x18 = zero_reg;
+  x19 = zero_reg;
+  x20 = zero_reg;
+  x21 = zero_reg;
+  x22 = zero_reg;
+  x23 = zero_reg;
+  x24 = zero_reg;
+  x25 = zero_reg;
+  x26 = zero_reg;
+  x27 = zero_reg;
+  x28 = zero_reg;
+  x29 = zero_reg;
+  x30 = zero_reg;
+  x31 = zero_reg
 }
