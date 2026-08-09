@@ -10,8 +10,15 @@
  * overridden by extensions.
  */
 
+/*
 val ext_init_regs : unit -> unit
 function ext_init_regs () = ()
+*/
+
+val ext_init_regs : unit -> unit
+function ext_init_regs () = {
+  misa[A] = 0b1
+}
 
 /*!
 This function is called after above when running rvfi and allows the model
