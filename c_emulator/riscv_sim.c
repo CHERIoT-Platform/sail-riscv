@@ -887,7 +887,8 @@ void flush_logs(void)
 
 #ifdef RVFI_DII
 
-#define MAX_LINE_LEN 8192
+//#define MAX_LINE_LEN 8192
+#define MAX_LINE_LEN 65536 
 static uint32_t *instr_buffer      = NULL;
 static size_t    instr_buffer_size = 0;
 static size_t    instr_buffer_pos  = 0;
@@ -1153,6 +1154,10 @@ void run_sail(void)
     exit(1);
   }
 
+  // insn_limit is only used in phase 2 (rvfi_file_mode == 0). 
+  // for phase 1 (rvfi_file_mode == 1), instr_buffer_size is the # of instructions
+  // in the input instruction file and ELF dump happens when all instructions are
+  // executed (instr_buffer_pos >= instr_buffer_size)
   while (!zhtif_done && (insn_limit == 0 || total_insns < insn_limit)) {
 #ifdef RVFI_DII
     if (rvfi_file_mode) {
