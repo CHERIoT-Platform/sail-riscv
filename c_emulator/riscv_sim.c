@@ -2,6 +2,7 @@
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -94,6 +95,11 @@ static const char *instr_file_path = NULL;
 static const char *rvfi_output_path = NULL;
 /* Path for ELF memory dump in file mode (NULL = auto-generate name) */
 static const char *elf_output_path  = NULL;
+static unsigned addata_marker_writes = 0;
+static bool have_addata_info = false;
+static uint32_t addata_offset = 0;
+static uint16_t addata_size = 0;
+_Static_assert(sizeof(addata_size) == 2, "addata_size must be 16 bits");
 static FILE *instr_write_log = NULL;
 #endif
 
@@ -359,7 +365,7 @@ static int process_args(int argc, char **argv)
       break;
     case OPT_PMP_COUNT:
       pmp_count = atol(optarg);
-      fprintf(stderr, "PMP count: %lld\n", pmp_count);
+      fprintf(stderr, "PMP count: %" PRIu64 "\n", pmp_count);
       if (pmp_count != 0 && pmp_count != 16 && pmp_count != 64) {
         fprintf(stderr, "invalid PMP count: must be 0, 16 or 64");
         exit(1);
@@ -368,7 +374,7 @@ static int process_args(int argc, char **argv)
       break;
     case OPT_PMP_GRAIN:
       pmp_grain = atol(optarg);
-      fprintf(stderr, "PMP grain: %lld\n", pmp_grain);
+      fprintf(stderr, "PMP grain: %" PRIu64 "\n", pmp_grain);
       if (pmp_grain >= 64) {
         fprintf(stderr, "invalid PMP grain: must less than 64");
         exit(1);
@@ -527,6 +533,154 @@ void check_elf(bool is32bit)
     }
   }
 }
+
+#ifdef CHERIOT_MODE
+static uint16_t elf_u16(const unsigned char *p)
+{
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t elf_u32(const unsigned char *p)
+{
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static bool elf_read_at(FILE *file, uint32_t offset, void *data, size_t size)
+{
+  return fseek(file, (long)offset, SEEK_SET) == 0 &&
+         fread(data, 1, size, file) == size;
+}
+
+static bool elf_range_valid(uint32_t offset, uint32_t size, uint64_t file_size)
+{
+  return (uint64_t)offset + size <= file_size;
+}
+
+static void embedded_addata_error(const char *path, const char *message)
+{
+  fprintf(stderr, "Invalid embedded additional data in '%s': %s\n",
+          path, message);
+  exit(1);
+}
+
+/* The normal Sail ELF loader ignores non-allocatable sections.  Overlay the
+ * CHERIoT additional data after it has loaded the PT_LOAD segments. */
+static void load_embedded_addata(const char *path)
+{
+  enum { ELF32_EHDR_SIZE = 52, ELF32_SHDR_SIZE = 40 };
+  unsigned char header[ELF32_EHDR_SIZE];
+  FILE *file = fopen(path, "rb");
+  if (file == NULL) {
+    fprintf(stderr, "Cannot open ELF file '%s': %s\n", path, strerror(errno));
+    exit(1);
+  }
+  if (fseek(file, 0, SEEK_END) != 0) embedded_addata_error(path, "cannot seek");
+  long end = ftell(file);
+  if (end < 0 || !elf_read_at(file, 0, header, sizeof(header)))
+    embedded_addata_error(path, "cannot read ELF header");
+
+  /* CHERIoT uses ELF32 little-endian files. */
+  if (memcmp(header, "\177ELF", 4) != 0 || header[4] != 1 || header[5] != 1) {
+    fclose(file);
+    return;
+  }
+
+  uint32_t shoff = elf_u32(header + 32);
+  uint16_t shentsize = elf_u16(header + 46);
+  uint16_t shnum = elf_u16(header + 48);
+  uint16_t shstrndx = elf_u16(header + 50);
+  uint64_t file_size = (uint64_t)end;
+  if (shnum == 0 || shstrndx == 0) {
+    fclose(file);
+    return;
+  }
+  if (shentsize != ELF32_SHDR_SIZE || shstrndx == UINT16_C(0xffff) ||
+      shstrndx >= shnum ||
+      (uint64_t)shoff + (uint64_t)shnum * shentsize > file_size)
+    embedded_addata_error(path, "unsupported section table");
+
+  unsigned char section[ELF32_SHDR_SIZE];
+  if (!elf_read_at(file, shoff + (uint32_t)shstrndx * shentsize,
+                   section, sizeof(section)))
+    embedded_addata_error(path, "cannot read section-name table header");
+  uint32_t names_offset = elf_u32(section + 16);
+  uint32_t names_size = elf_u32(section + 20);
+  if (names_size == 0 || !elf_range_valid(names_offset, names_size, file_size))
+    embedded_addata_error(path, "invalid section-name table");
+  char *names = malloc(names_size);
+  if (names == NULL || !elf_read_at(file, names_offset, names, names_size))
+    embedded_addata_error(path, "cannot read section names");
+
+  uint32_t info_offset = 0, info_size = 0;
+  uint32_t main_offset = 0, main_size = 0;
+  uint32_t tags_offset = 0, tags_size = 0;
+  bool have_info = false, have_main = false, have_tags = false;
+  for (uint16_t index = 0; index < shnum; index++) {
+    if (!elf_read_at(file, shoff + (uint32_t)index * shentsize,
+                     section, sizeof(section)))
+      embedded_addata_error(path, "cannot read section header");
+    uint32_t name_offset = elf_u32(section);
+    if (name_offset >= names_size ||
+        memchr(names + name_offset, '\0', names_size - name_offset) == NULL)
+      embedded_addata_error(path, "invalid section name");
+
+    bool *present = NULL;
+    uint32_t *offset = NULL, *size = NULL;
+    const char *name = names + name_offset;
+    if (strcmp(name, ".addata_info") == 0) {
+      present = &have_info; offset = &info_offset; size = &info_size;
+    } else if (strcmp(name, ".addata_main") == 0) {
+      present = &have_main; offset = &main_offset; size = &main_size;
+    } else if (strcmp(name, ".addata_tags") == 0) {
+      present = &have_tags; offset = &tags_offset; size = &tags_size;
+    } else {
+      continue;
+    }
+    if (*present) embedded_addata_error(path, "duplicate additional-data section");
+    *present = true;
+    *offset = elf_u32(section + 16);
+    *size = elf_u32(section + 20);
+    if (elf_u32(section + 4) != 1 ||
+        !elf_range_valid(*offset, *size, file_size))
+      embedded_addata_error(path, "invalid additional-data section");
+  }
+  free(names);
+
+  if (!have_main && !have_tags) {
+    fclose(file);
+    return;
+  }
+  if (!have_info || !have_main || !have_tags || info_size != 8)
+    embedded_addata_error(path, "incomplete additional-data sections");
+
+  unsigned char info[8];
+  if (!elf_read_at(file, info_offset, info, sizeof(info)))
+    embedded_addata_error(path, "cannot read .addata_info");
+  uint32_t address = elf_u32(info);
+  uint32_t count = elf_u32(info + 4);
+  if ((address & 7) != 0 || count > UINT32_C(0x3ff) ||
+      (uint64_t)address + (uint64_t)count * 8 > UINT64_C(0x100000000) ||
+      main_size != count * 8 || tags_size != count)
+    embedded_addata_error(path, "inconsistent section sizes or address range");
+
+  for (uint32_t index = 0; index < count; index++) {
+    unsigned char data[8], tag;
+    if (!elf_read_at(file, main_offset + index * 8, data, sizeof(data)) ||
+        !elf_read_at(file, tags_offset + index, &tag, sizeof(tag)))
+      embedded_addata_error(path, "cannot read additional-data entry");
+    if (tag > 1)
+      embedded_addata_error(path, ".addata_tags contains a non-boolean tag");
+    for (unsigned byte = 0; byte < sizeof(data); byte++)
+      write_mem(address + index * 8 + byte, data[byte]);
+    write_tag_bool((address + index * 8) >> 3, tag != 0);
+  }
+  fclose(file);
+  fprintf(stderr, "Loaded %" PRIu32 " embedded additional-data entr%s from %s\n",
+          count, count == 1 ? "y" : "ies", path);
+}
+#endif
+
 uint64_t load_sail(char *f, bool main_file)
 {
   bool is32bit;
@@ -534,6 +688,9 @@ uint64_t load_sail(char *f, bool main_file)
   uint64_t begin_sig, end_sig;
   load_elf(f, &is32bit, &entry);
   check_elf(is32bit);
+#ifdef CHERIOT_MODE
+  load_embedded_addata(f);
+#endif
   if (!main_file) {
     /* Don't scan for test-signature/htif symbols for additional ELF files. */
     return entry;
@@ -996,22 +1153,42 @@ void rvfi_send_trace(unsigned version)
 }
 
 
+static uint64_t rvfi_v1_field(const lbits *packet,
+                              mp_bitcnt_t first_bit,
+                              unsigned width)
+{
+  uint64_t value = 0;
+  for (unsigned bit = 0; bit < width; bit++) {
+    if (mpz_tstbit(*(packet->bits), first_bit + bit))
+      value |= UINT64_C(1) << bit;
+  }
+  return value;
+}
+
 /* RVFI v1 packet field rvfi_trap occupies bits [727:720]. */
 static bool rvfi_v1_trapped(void)
 {
   lbits packet;
-  bool trapped = false;
-
   CREATE(lbits)(&packet);
   zrvfi_get_exec_packet_v1(&packet, UNIT);
 
-  for (mp_bitcnt_t bit = 720; bit <= 727; bit++) {
-    if (mpz_tstbit(*(packet.bits), bit)) {
-      trapped = true;
-      break;
+  if (rvfi_v1_field(&packet, 688, 8) != 0 &&
+      (uint32_t)rvfi_v1_field(&packet, 472, 64) == UINT32_C(0xffffff00) &&
+      addata_marker_writes < 2) {
+    uint64_t write_data = rvfi_v1_field(&packet, 608, 64);
+    if (addata_marker_writes++ == 0) {
+      addata_offset = (uint32_t)write_data & ~UINT32_C(7);
+    } else {
+      addata_size = (uint16_t)(write_data & UINT64_C(0x03ff));
+      fprintf(stderr,
+              "ADDATA marker 2: write_data=0x%016" PRIx64
+              " size=0x%03" PRIx16 "\n",
+              write_data, addata_size);
+      have_addata_info = true;
     }
   }
 
+  bool trapped = rvfi_v1_field(&packet, 720, 8) != 0;
   KILL(lbits)(&packet);
   return trapped;
 }
@@ -1239,7 +1416,8 @@ void run_sail(void)
         // initialize_empty_halfwords();
         // if (instr_write_log != NULL) 
         //   fclose(instr_write_log);
-        dump_elf_mem(dump_filename, RVFI_RESET_PC, (int)zxlen_val);
+        dump_elf_mem(dump_filename, RVFI_RESET_PC, (int)zxlen_val,
+                     have_addata_info, addata_offset, addata_size);
         fprintf(stderr, "Memory dumped to %s\n", dump_filename);
         break;
       }
@@ -1302,7 +1480,8 @@ void run_sail(void)
           char dump_filename[256];
           snprintf(dump_filename, sizeof(dump_filename),
                    "memdump_%06" PRIu64 ".elf", dii_trace_count++);
-          dump_elf_mem(dump_filename,  RVFI_RESET_PC, (int)zxlen_val);
+          dump_elf_mem(dump_filename, RVFI_RESET_PC, (int)zxlen_val,
+                       false, 0, 0);
           return;
         }
       }

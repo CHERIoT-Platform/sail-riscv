@@ -27,10 +27,14 @@ uint8_t read_elf_mem(uint64_t addr);
  *
  * Consecutive addresses are combined into one PT_LOAD segment.  Disjoint
  * address ranges are emitted as separate PT_LOAD segments.
+ * When have_addata_info is true, .addata_info contains two little-endian
+ * uint32 values: the aligned start offset and entry count.
  *
  * xlen must be either 32 or 64.  The function returns true on success.
  */
-bool dump_elf_mem(const char *filename, uint64_t entry_point, int xlen);
+bool dump_elf_mem(const char *filename, uint64_t entry_point, int xlen,
+                  bool have_addata_info, uint32_t addata_offset,
+                  uint16_t addata_size);
 
 #ifdef __cplusplus
 }

@@ -34,7 +34,10 @@ using namespace ELFIO;
 
 extern "C" bool dump_elf_mem(const char *filename,
                              uint64_t entry_point,
-                             int xlen)
+                             int xlen,
+                             bool have_addata_info,
+                             uint32_t addata_offset,
+                             uint16_t addata_size)
 {
     if (filename == nullptr) {
         std::fprintf(stderr, "mem_dump: output filename is null\n");
@@ -116,6 +119,23 @@ extern "C" bool dump_elf_mem(const char *filename,
     }
 
     flush_segment();
+
+    if (have_addata_info) {
+        const uint8_t info[8] = {
+            static_cast<uint8_t>(addata_offset),
+            static_cast<uint8_t>(addata_offset >> 8),
+            static_cast<uint8_t>(addata_offset >> 16),
+            static_cast<uint8_t>(addata_offset >> 24),
+            static_cast<uint8_t>(addata_size),
+            static_cast<uint8_t>(addata_size >> 8),
+            0, 0
+        };
+        section *sec = writer.sections.add(".addata_info");
+        sec->set_type(SHT_PROGBITS);
+        sec->set_flags(0);
+        sec->set_addr_align(4);
+        sec->set_data(reinterpret_cast<const char *>(info), sizeof(info));
+    }
 
     section *str_sec = writer.sections.add(".strtab");
     str_sec->set_type(SHT_STRTAB);
