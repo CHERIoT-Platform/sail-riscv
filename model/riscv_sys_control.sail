@@ -477,6 +477,12 @@ function handle_interrupt(i : InterruptType, del_priv : Privilege) -> unit =
 
 /* state state initialization */
 
+$ifdef RVFI_DII
+function init_mcycle_lfsr() -> unit = rvfi_mcycle_lfsr = 0xdeadbeef
+$else
+function init_mcycle_lfsr() -> unit = ()
+$endif
+
 function init_sys() -> unit = {
   cur_privilege = Machine;
 
@@ -485,8 +491,10 @@ function init_sys() -> unit = {
   misa[MXL] = arch_to_bits(if sizeof(xlen) == 32 then RV32 else RV64);
   misa[A]   = 0b0;                             /* atomics */
   misa[C]   = bool_to_bits(sys_enable_rvc());  /* RVC */
-  misa[I]   = 0b0;                             /* base integer ISA */
-  misa[E]   = 0b1;
+  misa[I]   = bool_to_bits(not(rv32e_register_file));
+  misa[E]   = bool_to_bits(rv32e_register_file);
+  /*misa[I]   = 0b0; */                            /* base integer ISA */
+  /*misa[E]   = 0b1; */
   misa[M]   = 0b1;                             /* integer multiply/divide */
   misa[U]   = 0b0;                             /* user-mode */
   misa[S]   = 0b0;                             /* supervisor-mode */
@@ -517,13 +525,15 @@ function init_sys() -> unit = {
   mie.bits     = zero_extend(0b0);
   mideleg.bits = zero_extend(0b0);
   medeleg.bits = zero_extend(0b0);
-  mtvec.bits   = zero_extend(0b0);
+  /* mtvec.bits   = zero_extend(0b0); */
+  mtvec.bits   = zero_extend(0x807f0000);
   mcause.bits  = zero_extend(0b0);
   mepc            = zero_extend(0b0);
   mtval           = zero_extend(0b0);
   mscratch        = zero_extend(0b0);
 
   mcycle          = zero_extend(0b0);
+  init_mcycle_lfsr();
   mtime           = zero_extend(0b0);
 
   mcounteren.bits = zero_extend(0b0);

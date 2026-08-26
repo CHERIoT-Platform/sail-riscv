@@ -67,6 +67,16 @@ function phys_mem_read forall 'n, 0 < 'n <= max_mem_access . (t : AccessType(ext
 }
 
 /* dispatches to MMIO regions or physical memory regions depending on physical memory map */
+$ifdef RVFI_DII
+function checked_mem_read forall 'n, 0 < 'n <= max_mem_access .
+  (t : AccessType(ext_access_type), paddr : xlenbits, width : atom('n),
+   aq : bool, rl : bool, res: bool, meta : bool)
+  -> MemoryOpResult((bits(8 * 'n), mem_meta)) =
+  match ext_check_phys_mem_read(t, paddr, width, aq, rl, res, meta) {
+    Ext_PhysAddr_OK() => phys_mem_read(t, paddr, width, aq, rl, res, meta),
+    Ext_PhysAddr_Error(e) => MemException(e)
+  }
+$else
 function checked_mem_read forall 'n, 0 < 'n <= max_mem_access . (t : AccessType(ext_access_type), paddr : xlenbits, width : atom('n), aq : bool, rl : bool, res: bool, meta : bool) -> MemoryOpResult((bits(8 * 'n), mem_meta)) =
   if   within_mmio_readable(paddr, width)
   then MemoryOpResult_add_meta(mmio_read(t, paddr, width), default_meta)
@@ -79,6 +89,7 @@ function checked_mem_read forall 'n, 0 < 'n <= max_mem_access . (t : AccessType(
     Read(Data) => MemException(E_Load_Access_Fault()),
     _          => MemException(E_SAMO_Access_Fault())
   }
+$endif
 
 /* PMP checks if enabled */
 function pmp_mem_read forall 'n, 0 < 'n <= max_mem_access . (t : AccessType(ext_access_type), p : Privilege, paddr : xlenbits, width : atom('n), aq : bool, rl : bool, res: bool, meta : bool) -> MemoryOpResult((bits(8 * 'n), mem_meta)) =
@@ -98,18 +109,39 @@ val rvfi_read : forall 'n, 'n > 0. (xlenbits, atom('n), MemoryOpResult((bits(8 *
 function rvfi_read (addr, width, result) = {
   rvfi_mem_data[rvfi_mem_addr] = zero_extend(addr);
   rvfi_mem_data_present = true;
+
   match result {
     /* TODO: report tag bit for capability writes and extend mask by one bit. */
-    MemValue(v, _) => if width <= 16
-                       then { rvfi_mem_data[rvfi_mem_rdata] = sail_zero_extend(v, 256);
-                              rvfi_mem_data[rvfi_mem_rmask] = rvfi_encode_width_mask(width) }
-                       else { internal_error(__FILE__, __LINE__, "Expected at most 16 bytes here!") },
+    MemValue(v, _) =>
+      if width <= 16
+      then {
+        let v256 : bits(256) = sail_zero_extend(v, 256);
+        rvfi_mem_data[rvfi_mem_rdata] = v256;
+        rvfi_mem_data[rvfi_mem_rmask] = rvfi_encode_width_mask(width);
+        rvfi_v1_mem_rdata72 = truncate(v256, 72)
+      }
+      else {
+        internal_error(__FILE__, __LINE__, "Expected at most 16 bytes here!")
+      },
     MemException(_) => ()
-  };
+  }
 }
+
+val rvfi_read65 : (xlenbits, bits(65)) -> unit
+function rvfi_read65(addr, v) = {
+  rvfi_mem_data[rvfi_mem_addr] = zero_extend(addr);
+  rvfi_mem_data_present = true;
+
+  rvfi_v1_mem_rdata72 = zero_extend(v);
+}
+
 $else
+
 val rvfi_read : forall 'n, 'n > 0. (xlenbits, atom('n), MemoryOpResult((bits(8 * 'n), mem_meta))) -> unit
 function rvfi_read (addr, width, result) = ()
+val rvfi_read65 : (xlenbits, bits(65)) -> unit
+function rvfi_read65(addr, v) = ()
+
 $endif
 
 /* NOTE: The rreg effect is due to MMIO. */
@@ -176,17 +208,31 @@ function rvfi_write (addr, width, value, meta, result) = {
     /* Log only the memory address (without the value) if the write fails. */
     MemValue(_) => if width <= 16 then {
         /* TODO: report tag bit for capability writes and extend mask by one bit. */
-        rvfi_mem_data[rvfi_mem_wdata] = sail_zero_extend(value,256);
+        let v256 : bits(256) = sail_zero_extend(value, 256);
+        rvfi_mem_data[rvfi_mem_wdata] = v256;
         rvfi_mem_data[rvfi_mem_wmask] = rvfi_encode_width_mask(width);
+        rvfi_v1_mem_wdata72 = truncate(v256, 72)
       } else {
         internal_error(__FILE__, __LINE__, "Expected at most 16 bytes here!");
       },
     MemException(_) => ()
   }
 }
+
+val rvfi_write65 : (xlenbits, bits(65)) -> unit
+function rvfi_write65(addr, v) = {
+  rvfi_mem_data[rvfi_mem_addr] = zero_extend(addr);
+  rvfi_mem_data_present = true;
+
+  rvfi_v1_mem_wdata72 = zero_extend(v);
+}
+
 $else
 val rvfi_write : forall 'n, 'n > 0. (xlenbits, atom('n), bits(8 * 'n), mem_meta, MemoryOpResult(bool)) -> unit
 function rvfi_write (addr, width, value, meta, result) = ()
+
+val rvfi_write65 : (xlenbits, bits(65)) -> unit
+function rvfi_write65(addr, v) = ()
 $endif
 
 // only used for actual memory regions, to avoid MMIO effects
@@ -198,6 +244,15 @@ function phys_mem_write forall 'n, 0 < 'n <= max_mem_access . (wk : write_kind, 
 }
 
 /* dispatches to MMIO regions or physical memory regions depending on physical memory map */
+$ifdef RVFI_DII
+function checked_mem_write forall 'n, 0 < 'n <= max_mem_access .
+  (wk : write_kind, paddr : xlenbits, width : atom('n),
+   data: bits(8 * 'n), meta: mem_meta) -> MemoryOpResult(bool) =
+  match ext_check_phys_mem_write(wk, paddr, width, data, meta) {
+    Ext_PhysAddr_OK() => phys_mem_write(wk, paddr, width, data, meta),
+    Ext_PhysAddr_Error(e) => MemException(e)
+  }
+$else
 function checked_mem_write forall 'n, 0 < 'n <= max_mem_access . (wk : write_kind, paddr : xlenbits, width : atom('n), data: bits(8 * 'n), meta: mem_meta) -> MemoryOpResult(bool) =
   if   within_mmio_writable(paddr, width)
   then mmio_write(paddr, width, data)
@@ -207,6 +262,7 @@ function checked_mem_write forall 'n, 0 < 'n <= max_mem_access . (wk : write_kin
     Ext_PhysAddr_Error(e)  => MemException(e)
   }
   else MemException(E_SAMO_Access_Fault())
+$endif
 
 /* PMP checks if enabled */
 function pmp_mem_write forall 'n, 0 < 'n <= max_mem_access . (wk: write_kind, paddr : xlenbits, width : atom('n), data: bits(8 * 'n), typ: AccessType(ext_access_type), priv: Privilege, meta: mem_meta) -> MemoryOpResult(bool) =

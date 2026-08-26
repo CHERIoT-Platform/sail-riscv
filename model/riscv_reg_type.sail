@@ -9,6 +9,9 @@
 /* default register type */
 type regtype = xlenbits
 
+/* Standalone RISC-V model implements RV32I with 32 registers. */
+let rv32e_register_file : bool = false
+
 /* default zero register */
 let zero_reg : regtype = zero_extend(0x0)
 

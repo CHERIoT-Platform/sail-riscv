@@ -2,6 +2,7 @@
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -22,6 +23,9 @@
 #include "riscv_platform.h"
 #include "riscv_platform_impl.h"
 #include "riscv_sail.h"
+#ifdef RVFI_DII
+#include "mem_dump.h"
+#endif
 
 #ifdef ENABLE_SPIKE
 #include "tv_spike_intf.h"
@@ -53,6 +57,20 @@ const char *RV32ISA = "RV32IMAC";
 #define OPT_ENABLE_WRITABLE_FIOM 1001
 #define OPT_PMP_COUNT 1002
 #define OPT_PMP_GRAIN 1003
+#define OPT_RVFI_OUTPUT 1004
+#define OPT_ELF_OUTPUT  1005
+
+/* Reset PC for RVFI builds. Bumped from 0x80000000 to 0x80000080 to
+ * match the Ibex / Kudu RTL reset vector. Used in two places that
+ * must agree:
+ *   1. main() initialises `entry` (the local var passed to
+ *      init_sail() which sets zPC) to this value.
+ *   2. mem_dump_elf() writes this as the ELF header's e_entry so
+ *      Phase-2 re-execution (load_sail -> zPC = elf_entry) lands on
+ *      the same instruction Phase 1 started at. Using rv_ram_base
+ *      (0x80000000) instead would leave a 128-byte hole at the entry,
+ *      and Phase 2 would terminate at the very first instr==0 fetch. */
+#define RVFI_RESET_PC UINT64_C(0x80000080)
 
 static bool do_dump_dts = false;
 static bool do_show_times = false;
@@ -70,6 +88,19 @@ static bool rvfi_dii = false;
 static unsigned rvfi_trace_version = 1;
 static int rvfi_dii_port;
 static int rvfi_dii_sock;
+
+static bool rvfi_file_mode = false;
+static const char *instr_file_path = NULL;
+/* Path for binary RVFI trace output in file mode (NULL = don't write) */
+static const char *rvfi_output_path = NULL;
+/* Path for ELF memory dump in file mode (NULL = auto-generate name) */
+static const char *elf_output_path  = NULL;
+static unsigned addata_marker_writes = 0;
+static bool have_addata_info = false;
+static uint32_t addata_offset = 0;
+static uint16_t addata_size = 0;
+_Static_assert(sizeof(addata_size) == 2, "addata_size must be 16 bits");
+static FILE *instr_write_log = NULL;
 #endif
 
 unsigned char *spike_dtb = NULL;
@@ -93,6 +124,25 @@ false
 true
 #endif
 ;
+
+static void initialize_empty_halfwords(void)
+{
+    const uint64_t base = UINT64_C(0x80000100);
+
+    for (unsigned i = 0; i < 64; i++) {
+        uint64_t addr = base + ((uint64_t)i * UINT64_C(0x100));
+
+        uint16_t value =
+            ((uint16_t)(uint8_t)read_mem(addr)) |
+            ((uint16_t)(uint8_t)read_mem(addr + 1) << 8);
+
+        if (value == UINT16_C(0x0000)) {
+            /* Little-endian encoding of 0xb701 (c.j -256)  */
+            write_elf_mem(addr,     UINT8_C(0x01));
+            write_elf_mem(addr + 1, UINT8_C(0xb7));
+        }
+    }
+}
 
 void set_config_print(char *var, bool val)
 {
@@ -149,6 +199,9 @@ static struct option options[] = {
     {"signature-granularity",       required_argument, 0, 'g'                     },
 #ifdef RVFI_DII
     {"rvfi-dii",                    required_argument, 0, 'r'                     },
+    {"instr-file",                  required_argument, 0, 'f'                     },
+    {"rvfi-output",                 required_argument, 0, OPT_RVFI_OUTPUT         },
+    {"elf-output",                  required_argument, 0, OPT_ELF_OUTPUT          },
 #endif
     {"help",                        no_argument,       0, 'h'                     },
     {"trace",                       optional_argument, 0, 'v'                     },
@@ -170,6 +223,10 @@ static void print_usage(const char *argv0, int ec)
   fprintf(stdout, "Usage: %s [options] <elf_file> [<elf_file> ...]\n", argv0);
 #ifdef RVFI_DII
   fprintf(stdout, "       %s [options] -r <port>\n", argv0);
+  fprintf(stdout, "       %s [options] -f <instr_file>\n", argv0);
+  fprintf(stdout,
+          "   --rvfi-output <file>  write binary RVFI trace to file (file mode)\n"
+          "   --elf-output  <file>  write ELF memory dump to file (file mode)\n");
 #endif
   struct option *opt = options;
   while (opt->name) {
@@ -278,6 +335,7 @@ static int process_args(int argc, char **argv)
                     "h"
 #ifdef RVFI_DII
                     "r:"
+                    "f:"
 #endif
 #ifdef SAILCOV
                     "c:"
@@ -307,7 +365,7 @@ static int process_args(int argc, char **argv)
       break;
     case OPT_PMP_COUNT:
       pmp_count = atol(optarg);
-      fprintf(stderr, "PMP count: %lld\n", pmp_count);
+      fprintf(stderr, "PMP count: %" PRIu64 "\n", pmp_count);
       if (pmp_count != 0 && pmp_count != 16 && pmp_count != 64) {
         fprintf(stderr, "invalid PMP count: must be 0, 16 or 64");
         exit(1);
@@ -316,7 +374,7 @@ static int process_args(int argc, char **argv)
       break;
     case OPT_PMP_GRAIN:
       pmp_grain = atol(optarg);
-      fprintf(stderr, "PMP grain: %lld\n", pmp_grain);
+      fprintf(stderr, "PMP grain: %" PRIu64 "\n", pmp_grain);
       if (pmp_grain >= 64) {
         fprintf(stderr, "invalid PMP grain: must less than 64");
         exit(1);
@@ -395,6 +453,20 @@ static int process_args(int argc, char **argv)
       rvfi_dii_port = atoi(optarg);
       fprintf(stderr, "using %d as RVFI port.\n", rvfi_dii_port);
       break;
+    case 'f':
+      rvfi_dii = true;
+      rvfi_file_mode = true;
+      instr_file_path = strdup(optarg);
+      fprintf(stderr, "using %s for instruction input.\n", instr_file_path);
+      break;
+    case OPT_RVFI_OUTPUT:
+      rvfi_output_path = strdup(optarg);
+      fprintf(stderr, "writing RVFI trace to %s\n", rvfi_output_path);
+      break;
+    case OPT_ELF_OUTPUT:
+      elf_output_path = strdup(optarg);
+      fprintf(stderr, "writing ELF memory dump to %s\n", elf_output_path);
+      break;
 #endif
     case 'V':
       set_config_print(optarg, false);
@@ -427,7 +499,7 @@ static int process_args(int argc, char **argv)
   if (do_dump_dts)
     dump_dts();
 #ifdef RVFI_DII
-  if (optind > argc || (optind == argc && !rvfi_dii))
+  if (optind > argc || (optind == argc && !rvfi_dii && instr_file_path == NULL))
     print_usage(argv[0], 0);
 #else
   if (optind >= argc) {
@@ -461,6 +533,154 @@ void check_elf(bool is32bit)
     }
   }
 }
+
+#ifdef CHERIOT_MODE
+static uint16_t elf_u16(const unsigned char *p)
+{
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t elf_u32(const unsigned char *p)
+{
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static bool elf_read_at(FILE *file, uint32_t offset, void *data, size_t size)
+{
+  return fseek(file, (long)offset, SEEK_SET) == 0 &&
+         fread(data, 1, size, file) == size;
+}
+
+static bool elf_range_valid(uint32_t offset, uint32_t size, uint64_t file_size)
+{
+  return (uint64_t)offset + size <= file_size;
+}
+
+static void embedded_addata_error(const char *path, const char *message)
+{
+  fprintf(stderr, "Invalid embedded additional data in '%s': %s\n",
+          path, message);
+  exit(1);
+}
+
+/* The normal Sail ELF loader ignores non-allocatable sections.  Overlay the
+ * CHERIoT additional data after it has loaded the PT_LOAD segments. */
+static void load_embedded_addata(const char *path)
+{
+  enum { ELF32_EHDR_SIZE = 52, ELF32_SHDR_SIZE = 40 };
+  unsigned char header[ELF32_EHDR_SIZE];
+  FILE *file = fopen(path, "rb");
+  if (file == NULL) {
+    fprintf(stderr, "Cannot open ELF file '%s': %s\n", path, strerror(errno));
+    exit(1);
+  }
+  if (fseek(file, 0, SEEK_END) != 0) embedded_addata_error(path, "cannot seek");
+  long end = ftell(file);
+  if (end < 0 || !elf_read_at(file, 0, header, sizeof(header)))
+    embedded_addata_error(path, "cannot read ELF header");
+
+  /* CHERIoT uses ELF32 little-endian files. */
+  if (memcmp(header, "\177ELF", 4) != 0 || header[4] != 1 || header[5] != 1) {
+    fclose(file);
+    return;
+  }
+
+  uint32_t shoff = elf_u32(header + 32);
+  uint16_t shentsize = elf_u16(header + 46);
+  uint16_t shnum = elf_u16(header + 48);
+  uint16_t shstrndx = elf_u16(header + 50);
+  uint64_t file_size = (uint64_t)end;
+  if (shnum == 0 || shstrndx == 0) {
+    fclose(file);
+    return;
+  }
+  if (shentsize != ELF32_SHDR_SIZE || shstrndx == UINT16_C(0xffff) ||
+      shstrndx >= shnum ||
+      (uint64_t)shoff + (uint64_t)shnum * shentsize > file_size)
+    embedded_addata_error(path, "unsupported section table");
+
+  unsigned char section[ELF32_SHDR_SIZE];
+  if (!elf_read_at(file, shoff + (uint32_t)shstrndx * shentsize,
+                   section, sizeof(section)))
+    embedded_addata_error(path, "cannot read section-name table header");
+  uint32_t names_offset = elf_u32(section + 16);
+  uint32_t names_size = elf_u32(section + 20);
+  if (names_size == 0 || !elf_range_valid(names_offset, names_size, file_size))
+    embedded_addata_error(path, "invalid section-name table");
+  char *names = malloc(names_size);
+  if (names == NULL || !elf_read_at(file, names_offset, names, names_size))
+    embedded_addata_error(path, "cannot read section names");
+
+  uint32_t info_offset = 0, info_size = 0;
+  uint32_t main_offset = 0, main_size = 0;
+  uint32_t tags_offset = 0, tags_size = 0;
+  bool have_info = false, have_main = false, have_tags = false;
+  for (uint16_t index = 0; index < shnum; index++) {
+    if (!elf_read_at(file, shoff + (uint32_t)index * shentsize,
+                     section, sizeof(section)))
+      embedded_addata_error(path, "cannot read section header");
+    uint32_t name_offset = elf_u32(section);
+    if (name_offset >= names_size ||
+        memchr(names + name_offset, '\0', names_size - name_offset) == NULL)
+      embedded_addata_error(path, "invalid section name");
+
+    bool *present = NULL;
+    uint32_t *offset = NULL, *size = NULL;
+    const char *name = names + name_offset;
+    if (strcmp(name, ".addata_info") == 0) {
+      present = &have_info; offset = &info_offset; size = &info_size;
+    } else if (strcmp(name, ".addata_main") == 0) {
+      present = &have_main; offset = &main_offset; size = &main_size;
+    } else if (strcmp(name, ".addata_tags") == 0) {
+      present = &have_tags; offset = &tags_offset; size = &tags_size;
+    } else {
+      continue;
+    }
+    if (*present) embedded_addata_error(path, "duplicate additional-data section");
+    *present = true;
+    *offset = elf_u32(section + 16);
+    *size = elf_u32(section + 20);
+    if (elf_u32(section + 4) != 1 ||
+        !elf_range_valid(*offset, *size, file_size))
+      embedded_addata_error(path, "invalid additional-data section");
+  }
+  free(names);
+
+  if (!have_main && !have_tags) {
+    fclose(file);
+    return;
+  }
+  if (!have_info || !have_main || !have_tags || info_size != 8)
+    embedded_addata_error(path, "incomplete additional-data sections");
+
+  unsigned char info[8];
+  if (!elf_read_at(file, info_offset, info, sizeof(info)))
+    embedded_addata_error(path, "cannot read .addata_info");
+  uint32_t address = elf_u32(info);
+  uint32_t count = elf_u32(info + 4);
+  if ((address & 7) != 0 || count > UINT32_C(0x3ff) ||
+      (uint64_t)address + (uint64_t)count * 8 > UINT64_C(0x100000000) ||
+      main_size != count * 8 || tags_size != count)
+    embedded_addata_error(path, "inconsistent section sizes or address range");
+
+  for (uint32_t index = 0; index < count; index++) {
+    unsigned char data[8], tag;
+    if (!elf_read_at(file, main_offset + index * 8, data, sizeof(data)) ||
+        !elf_read_at(file, tags_offset + index, &tag, sizeof(tag)))
+      embedded_addata_error(path, "cannot read additional-data entry");
+    if (tag > 1)
+      embedded_addata_error(path, ".addata_tags contains a non-boolean tag");
+    for (unsigned byte = 0; byte < sizeof(data); byte++)
+      write_mem(address + index * 8 + byte, data[byte]);
+    write_tag_bool((address + index * 8) >> 3, tag != 0);
+  }
+  fclose(file);
+  fprintf(stderr, "Loaded %" PRIu32 " embedded additional-data entr%s from %s\n",
+          count, count == 1 ? "y" : "ies", path);
+}
+#endif
+
 uint64_t load_sail(char *f, bool main_file)
 {
   bool is32bit;
@@ -468,17 +688,22 @@ uint64_t load_sail(char *f, bool main_file)
   uint64_t begin_sig, end_sig;
   load_elf(f, &is32bit, &entry);
   check_elf(is32bit);
+#ifdef CHERIOT_MODE
+  load_embedded_addata(f);
+#endif
   if (!main_file) {
     /* Don't scan for test-signature/htif symbols for additional ELF files. */
     return entry;
   }
   fprintf(stdout, "ELF Entry @ 0x%" PRIx64 "\n", entry);
-  /* locate htif ports */
+  /* locate htif ports – non-fatal so memory-dump ELFs (which embed tohost=0)
+   * load cleanly; the default rv_htif_tohost value is preserved on failure. */
   if (lookup_sym(f, "tohost", &rv_htif_tohost) < 0) {
-    fprintf(stderr, "Unable to locate htif tohost port.\n");
-    exit(1);
+    fprintf(stderr, "tohost symbol not found; using default 0x%" PRIx64 "\n",
+            rv_htif_tohost);
+  } else {
+    fprintf(stderr, "tohost located at 0x%0" PRIx64 "\n", rv_htif_tohost);
   }
-  fprintf(stderr, "tohost located at 0x%0" PRIx64 "\n", rv_htif_tohost);
   /* locate test-signature locations if any */
   if (!lookup_sym(f, "begin_signature", &begin_sig)) {
     fprintf(stdout, "begin_signature: 0x%0" PRIx64 "\n", begin_sig);
@@ -637,13 +862,23 @@ void init_sail(uint64_t elf_entry)
     rv_clint_size = UINT64_C(0);
     rv_htif_tohost = UINT64_C(0);
     zPC = elf_entry;
-  } else
-#endif
+  } else {
+    /* Non-DII mode in RVFI binary: re-executing a dump ELF.
+     * The RVFI fetch function always reads from rvfi_instruction[rvfi_insn],
+     * so zext_rvfi_init must be called to put that state into a known-good
+     * state.  We skip the boot ROM and jump directly to the ELF entry point;
+     * the normal platform memory map (rv_ram_base etc.) stays at its default
+     * so the full 64 MB RAM window is available. */
+    zext_rvfi_init(UNIT);
+    zPC = elf_entry;
+  }
+#else
   if (config_use_boot_rom) {
     init_sail_reset_vector(elf_entry);
   } else {
     zPC = elf_entry;
   }
+#endif
 
   // this is probably unnecessary now; remove
   if (!rv_enable_rvc)
@@ -809,6 +1044,58 @@ void flush_logs(void)
 
 #ifdef RVFI_DII
 
+//#define MAX_LINE_LEN 8192
+#define MAX_LINE_LEN 65536 
+static uint32_t *instr_buffer      = NULL;
+static size_t    instr_buffer_size = 0;
+static size_t    instr_buffer_pos  = 0;
+
+/*
+ * Read instructions from a text file into instr_buffer.
+ *
+ * Parsing rules:
+ *   - '#' begins a comment; everything from '#' to end-of-line is ignored.
+ *   - After stripping the comment, the remaining text is scanned for the
+ *     first "0x" token.  If found, that hex value is taken as the instruction.
+ *   - Lines with no "0x" token (blank, pure-comment, label-only) are skipped.
+ *
+ * This means all of the following formats work correctly:
+ *   0x47018113            <- bare hex
+ *   0x47018113  # addi    <- hex with trailing comment
+ *   .4byte 0x47018113     <- assembler directive
+ *   # this whole line is a comment
+ *   #0x34109073           <- entire line commented out — skipped, not parsed
+ */
+static void read_instr_file(const char *path)
+{
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    fprintf(stderr, "Cannot open instruction file '%s': %s\n", path,
+            strerror(errno));
+    exit(1);
+  }
+  char line[MAX_LINE_LEN];
+  instr_buffer_size = 0;
+  instr_buffer      = malloc(MAX_LINE_LEN * sizeof(uint32_t));
+  if (!instr_buffer) {
+    fprintf(stderr, "Cannot allocate memory for instruction buffer.\n");
+    exit(1);
+  }
+  while (fgets(line, sizeof(line), f)) {
+    /* Strip comment: terminate the string at the first '#'. */
+    char *comment = strchr(line, '#');
+    if (comment)
+      *comment = '\0';
+    /* Now look for a hex literal in what remains. */
+    char *hex_start = strstr(line, "0x");
+    if (!hex_start)
+      continue;
+    instr_buffer[instr_buffer_size++] = (uint32_t)strtoul(hex_start, NULL, 16);
+  }
+  fclose(f);
+  instr_buffer_pos = 0;
+}
+
 typedef void (*packet_reader_fn)(lbits *rop, unit);
 static void get_and_send_rvfi_packet(packet_reader_fn reader)
 {
@@ -865,6 +1152,128 @@ void rvfi_send_trace(unsigned version)
   }
 }
 
+
+static uint64_t rvfi_v1_field(const lbits *packet,
+                              mp_bitcnt_t first_bit,
+                              unsigned width)
+{
+  uint64_t value = 0;
+  for (unsigned bit = 0; bit < width; bit++) {
+    if (mpz_tstbit(*(packet->bits), first_bit + bit))
+      value |= UINT64_C(1) << bit;
+  }
+  return value;
+}
+
+/* RVFI v1 packet field rvfi_trap occupies bits [727:720]. */
+static bool rvfi_v1_trapped(void)
+{
+  lbits packet;
+  CREATE(lbits)(&packet);
+  zrvfi_get_exec_packet_v1(&packet, UNIT);
+
+  if (rvfi_v1_field(&packet, 688, 8) != 0 &&
+      (uint32_t)rvfi_v1_field(&packet, 472, 64) == UINT32_C(0xffffff00) &&
+      addata_marker_writes < 2) {
+    uint64_t write_data = rvfi_v1_field(&packet, 608, 64);
+    if (addata_marker_writes++ == 0) {
+      addata_offset = (uint32_t)write_data & ~UINT32_C(7);
+    } else {
+      addata_size = (uint16_t)(write_data & UINT64_C(0x03ff));
+      fprintf(stderr,
+              "ADDATA marker 2: write_data=0x%016" PRIx64
+              " size=0x%03" PRIx16 "\n",
+              write_data, addata_size);
+      have_addata_info = true;
+    }
+  }
+
+  bool trapped = rvfi_v1_field(&packet, 720, 8) != 0;
+  KILL(lbits)(&packet);
+  return trapped;
+}
+#define INSN_CSPECIALR_CA5_MTCC  UINT32_C(0x03c007db)
+#define INSN_CSPECIALR_CA4_MEPCC UINT32_C(0x03f0075b)
+#define INSN_CSETADDR_CA5_CA5_A4 UINT32_C(0x20e787db)
+#define INSN_CINCOFFSET_CA5_4    UINT32_C(0x004797db)
+#define INSN_CSPECIALW_MEPCC_CA5 UINT32_C(0x03f7805b)
+#define INSN_MRET                UINT32_C(0x30200073)
+
+#define INSN_CSRR_A5_MEPC        UINT32_C(0x341027f3)
+#define INSN_ADD_A5_4            UINT32_C(0x00478793)   
+#define INSN_CSRW_MEPC_A5        UINT32_C(0x34179073)
+
+
+// #define INSN_CSPECIALR_CA5_MEPCC UINT32_C(0x03f007db)
+//#define INSN_CINCOFFSET_CA5_2    UINT32_C(0x002797db)
+//#define INSN_CINCOFFSET_CA5_4    UINT32_C(0x004797db)
+//#define INSN_CSPECIALW_MEPCC_CA5 UINT32_C(0x03f7805b)
+
+static bool insert_trap_handler(uint32_t trapped_instr,
+                                        mach_int *step_no,
+                                        int *insn_cnt,
+                                        int rvfi_trace_fd)
+{
+#ifdef CHERIOT_MODE
+  const uint32_t handler[] = {
+    INSN_CSPECIALR_CA5_MTCC,  
+    INSN_CSPECIALR_CA4_MEPCC,
+    INSN_CSETADDR_CA5_CA5_A4,
+    INSN_CINCOFFSET_CA5_4,  
+    INSN_CSPECIALW_MEPCC_CA5,
+    INSN_MRET              
+  };
+#else
+  const uint32_t handler[] = {
+    INSN_CSRR_A5_MEPC, 
+    INSN_ADD_A5_4,     
+    INSN_CSRW_MEPC_A5, 
+    INSN_MRET              
+  };
+
+#endif
+
+  uint64_t pc = 0x807f0000;
+  for (size_t i = 0; i < sizeof(handler) / sizeof(handler[0]); i++) {
+    uint32_t instr = handler[i];
+
+    /* All trap-handler instructions are 32-bit. */
+    for (uint32_t b = 0; b < 4; b++) {
+      write_elf_mem(pc + b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+      //fprintf(instr_write_log, "  write_mem addr=0x%08x data=0x%02x \n", pc+b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+    }
+
+    pc += 4;
+
+    zrvfi_set_instr_packet(instr);
+    zrvfi_zzero_exec_packet(UNIT);
+
+    sail_int sail_step;
+    CREATE(sail_int)(&sail_step);
+    (*step_no)++;
+    CONVERT_OF(sail_int, mach_int)(&sail_step, *step_no);
+    bool handler_stepped = zstep(sail_step);
+
+    if (have_exception) {
+      KILL(sail_int)(&sail_step);
+      return false;
+    }
+
+    flush_logs();
+    KILL(sail_int)(&sail_step);
+
+    if (rvfi_trace_fd >= 0)
+      rvfi_send_trace(rvfi_trace_version);
+
+    if (handler_stepped) {
+      (*insn_cnt)++;
+      total_insns++;
+    }
+  }
+
+  return true;
+}
+
 #endif
 
 void run_sail(void)
@@ -878,6 +1287,42 @@ void run_sail(void)
   int insn_cnt = 0;
 #ifdef RVFI_DII
   bool need_instr = true;
+
+  /* File descriptor used for RVFI trace output in file mode.
+   * We assign it to rvfi_dii_sock so that rvfi_send_trace() writes to the
+   * file without any other changes to the existing packet-sending logic. */
+  int rvfi_trace_fd = -1;
+  if (rvfi_file_mode) {
+    read_instr_file(instr_file_path);
+  }
+  /* Open the RVFI trace file for any mode that has --rvfi-output set:
+   *   - Phase 1 `-f` instruction-file mode (rvfi_file_mode=true,
+   *     and rvfi_dii is also set to true by the `-f` handler at line
+   *     419 — file mode is treated as a sub-case of DII upstream).
+   *   - Phase 2 ELF re-exec (rvfi_dii=false, rvfi_file_mode=false).
+   * The only mode we must NOT redirect is pure socket DII
+   * (rvfi_dii=true, rvfi_file_mode=false), where rvfi_dii_sock is the
+   * live network socket. */
+  if (rvfi_output_path != NULL && (rvfi_file_mode || !rvfi_dii)) {
+    rvfi_trace_fd = open(rvfi_output_path,
+                         O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (rvfi_trace_fd < 0) {
+      fprintf(stderr, "Cannot open RVFI output file '%s': %s\n",
+              rvfi_output_path, strerror(errno));
+      exit(1);
+    }
+    /* Redirect rvfi_send_trace() output to the file. */
+    rvfi_dii_sock = rvfi_trace_fd;
+  }
+
+  //if (instr_write_log == NULL) {
+  //  instr_write_log = fopen("instr_mem_writes.log", "w");
+  //  if (instr_write_log == NULL) {
+  //    fprintf(stderr, "Failed to open instruction memory log: %s\n",
+  //            strerror(errno));
+  //    exit(1);
+  //  }
+  //}
 #endif
 
   struct timeval interval_start;
@@ -886,9 +1331,97 @@ void run_sail(void)
     exit(1);
   }
 
+  // insn_limit is only used in phase 2 (rvfi_file_mode == 0). 
+  // for phase 1 (rvfi_file_mode == 1), instr_buffer_size is the # of instructions
+  // in the input instruction file and ELF dump happens when all instructions are
+  // executed (instr_buffer_pos >= instr_buffer_size)
   while (!zhtif_done && (insn_limit == 0 || total_insns < insn_limit)) {
 #ifdef RVFI_DII
-    if (rvfi_dii) {
+    if (rvfi_file_mode) {
+      if (instr_buffer_pos < instr_buffer_size) {
+        uint32_t instr = instr_buffer[instr_buffer_pos++];
+        /* Write the instruction bytes into Sail's memory model at the
+         * current PC before injecting it via DII.
+         *
+         * The DII interface bypasses the normal memory-fetch path, so
+         * without this the instruction bytes never appear in RAM.  Writing
+         * them here ensures that the post-execution memory dump captures the
+         * full instruction stream, including any locations that a subsequent
+         * store instruction may later overwrite.
+         *
+         * Instruction width: RISC-V instructions with bits[1:0] == 0b11 are
+         * 32-bit; all other encodings (RVC) are 16-bit. */
+        {
+          uint64_t pc        = zPC;
+          uint32_t instr_len = ((instr & 0x3U) == 0x3U) ? 4U : 2U;
+          for (uint32_t b = 0; b < instr_len; b++) {
+            if (!test_elf_mem(pc+b, 1)) {
+              write_elf_mem(pc + b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+              //fprintf(instr_write_log, "  write_mem addr=0x%08x data=0x%02x \n", pc+b, (uint64_t)((instr >> (b * 8U)) & 0xFFU));
+            }
+          }
+        }
+        zrvfi_set_instr_packet(instr);
+        zrvfi_zzero_exec_packet(UNIT);
+        sail_int sail_step;
+        CREATE(sail_int)(&sail_step);
+        CONVERT_OF(sail_int, mach_int)(&sail_step, step_no);
+        stepped = zstep(sail_step);
+        if (have_exception)
+          goto step_exception;
+        flush_logs();
+        KILL(sail_int)(&sail_step);
+        /* Emit RVFI execution trace packet for this instruction, if a trace
+         * output file was requested via --rvfi-output. */
+        if (rvfi_trace_fd >= 0)
+          rvfi_send_trace(rvfi_trace_version);
+
+        if (rvfi_v1_trapped()) {
+          if (!insert_trap_handler(instr, &step_no, &insn_cnt,
+                                           rvfi_trace_fd))
+            goto step_exception;
+        }
+      } else {
+        /* All instructions consumed.
+         * 1. Send a halt packet so the trace file is self-contained and can
+         *    be compared directly with an RTL trace (which also ends with a
+         *    halt entry).
+         * 2. Close the trace file before dumping the ELF.
+         * 3. Dump the settled post-execution memory state to an ELF so it
+         *    can be reloaded and re-executed for a reproducible second pass. */
+        if (rvfi_trace_fd >= 0) {
+          zrvfi_halt_exec_packet(UNIT);
+          rvfi_send_trace(rvfi_trace_version);
+          close(rvfi_trace_fd);
+          rvfi_trace_fd = -1;
+          fprintf(stderr, "RVFI trace written to %s\n", rvfi_output_path);
+        }
+        /* Choose ELF output filename: explicit path, or auto-generated. */
+        char auto_dump_filename[256];
+        const char *dump_filename;
+        if (elf_output_path != NULL) {
+          dump_filename = elf_output_path;
+        } else {
+          static uint64_t file_run_count = 0;
+          snprintf(auto_dump_filename, sizeof(auto_dump_filename),
+                   "memdump_%06" PRIu64 ".elf", file_run_count++);
+          dump_filename = auto_dump_filename;
+        }
+        /* entry_point = RVFI_RESET_PC (NOT rv_ram_base): Phase 1 began
+         * fetching at 0x80000080 so the live PT_LOAD segment starts
+         * there; e_entry must match or Phase 2 re-execution would set
+         * zPC = 0x80000000 and immediately hit instr==0 in the
+         * unmapped 128-byte gap. */
+
+        // initialize_empty_halfwords();
+        // if (instr_write_log != NULL) 
+        //   fclose(instr_write_log);
+        dump_elf_mem(dump_filename, RVFI_RESET_PC, (int)zxlen_val,
+                     have_addata_info, addata_offset, addata_size);
+        fprintf(stderr, "Memory dumped to %s\n", dump_filename);
+        break;
+      }
+    } else if (rvfi_dii) {
       mach_bits instr_bits;
       if (config_print_rvfi) {
         fprintf(stderr, "Waiting for cmd packet... ");
@@ -937,6 +1470,18 @@ void run_sail(void)
         } else {
           zrvfi_halt_exec_packet(UNIT);
           rvfi_send_trace(rvfi_trace_version);
+          /* Dump memory once after all instructions have been executed.
+           * This captures the settled memory state (including any
+           * self-modifications from jump/branch/store instructions) so it
+           * can be reloaded and re-executed for a consistent, reproducible
+           * second-pass RVFI execution.  The entry point is set to
+           * RVFI_RESET_PC so re-execution begins where Phase 1 did. */
+          static uint64_t dii_trace_count = 0;
+          char dump_filename[256];
+          snprintf(dump_filename, sizeof(dump_filename),
+                   "memdump_%06" PRIu64 ".elf", dii_trace_count++);
+          dump_elf_mem(dump_filename, RVFI_RESET_PC, (int)zxlen_val,
+                       false, 0, 0);
           return;
         }
       }
@@ -984,9 +1529,61 @@ void run_sail(void)
       flush_logs();
       KILL(sail_int)(&sail_step);
       rvfi_send_trace(rvfi_trace_version);
-    } else /* if (!rvfi_dii) */
+    } else /* if (!rvfi_dii && !rvfi_file_mode) */
 #endif
     { /* run a Sail step */
+#ifdef RVFI_DII
+      /* Non-DII mode in the RVFI binary (re-executing a dump ELF).
+       * The RVFI model's fetch function always reads from
+       * rvfi_instruction[rvfi_insn] rather than fetching from physical
+       * memory.  We therefore read the instruction bytes from Sail's
+       * memory model at the current PC and inject them as a DII packet
+       * before each step, emulating what a real fetch would do. */
+      {
+        uint64_t pc = zPC;
+        /* Fetch the instruction bytes from Sail's memory model. */
+        uint8_t  b0 = (uint8_t)read_mem(pc + 0);
+        uint8_t  b1 = (uint8_t)read_mem(pc + 1);
+        uint32_t instr;
+        if ((b0 & 0x3U) != 0x3U) {
+          /* 16-bit RVC instruction */
+          instr = (uint32_t)b0 | ((uint32_t)b1 << 8);
+        } else {
+          /* 32-bit instruction */
+          instr = (uint32_t)b0
+                | ((uint32_t)b1                          << 8)
+                | ((uint32_t)(uint8_t)read_mem(pc + 2) << 16)
+                | ((uint32_t)(uint8_t)read_mem(pc + 3) << 24);
+        }
+        /* Termination: an all-zero instruction word means we have walked
+         * into uninitialised memory – stop cleanly.
+         *
+         * We intentionally do NOT use a PC-range check here.  A PC-range
+         * check would incorrectly terminate re-execution when a legitimate
+         * exception handler runs at address 0x0 (the RISC-V default mtvec).
+         * All-zero (0x00000000) is never a valid RISC-V instruction, so it
+         * is a safe and portable end-of-program sentinel. */
+        /*if (instr == 0) { */
+        if (0) {
+          fprintf(stderr,
+                  "[re-exec] zero instruction at PC 0x%" PRIx64 " – stopping.\n",
+                  pc);
+          /* Match Phase 1's behaviour: emit a final halt packet so the
+           * Phase-2 RVFI trace ends with a known sentinel and is directly
+           * comparable to an RTL trace. */
+          if (rvfi_trace_fd >= 0) {
+            zrvfi_halt_exec_packet(UNIT);
+            rvfi_send_trace(rvfi_trace_version);
+            close(rvfi_trace_fd);
+            rvfi_trace_fd = -1;
+            fprintf(stderr, "RVFI trace written to %s\n", rvfi_output_path);
+          }
+          break;
+        }
+        zrvfi_set_instr_packet(instr);
+        zrvfi_zzero_exec_packet(UNIT);
+      }
+#endif
       sail_int sail_step;
       CREATE(sail_int)(&sail_step);
       CONVERT_OF(sail_int, mach_int)(&sail_step, step_no);
@@ -995,6 +1592,14 @@ void run_sail(void)
         goto step_exception;
       flush_logs();
       KILL(sail_int)(&sail_step);
+#ifdef RVFI_DII
+      /* Phase 2 ELF re-exec: emit one RVFI exec packet per stepped
+       * instruction so --rvfi-output produces the same binary stream
+       * Phase 1 does, just sourced from physical memory instead of the
+       * instruction-file buffer. */
+      if (rvfi_trace_fd >= 0)
+        rvfi_send_trace(rvfi_trace_version);
+#endif
     }
     if (stepped) {
       step_no++;
@@ -1055,6 +1660,20 @@ void run_sail(void)
     }
   }
 
+#ifdef RVFI_DII
+  /* Safety net for loop exits that don't go through one of the
+   * mode-specific close paths (insn_limit reached, zhtif_done, divergence,
+   * etc.). Phase 1's rvfi_file_mode block already closes its own fd and
+   * sets it to -1, so this is a no-op there. */
+  if (rvfi_trace_fd >= 0) {
+    zrvfi_halt_exec_packet(UNIT);
+    rvfi_send_trace(rvfi_trace_version);
+    close(rvfi_trace_fd);
+    rvfi_trace_fd = -1;
+    fprintf(stderr, "RVFI trace written to %s\n", rvfi_output_path);
+  }
+#endif
+
 dump_state:
   if (diverged) {
     /* TODO */
@@ -1062,7 +1681,14 @@ dump_state:
   finish(diverged | zhtif_exit_code);
 
 step_exception:
-  fprintf(stderr, "Sail exception!");
+  fprintf(stderr, "Sail exception!\n");
+#ifdef RVFI_DII
+  /* Close the RVFI trace file on exception so it isn't left half-written. */
+  if (rvfi_trace_fd >= 0) {
+    close(rvfi_trace_fd);
+    rvfi_trace_fd = -1;
+  }
+#endif
   goto dump_state;
 }
 
@@ -1117,8 +1743,10 @@ int main(int argc, char **argv)
 
 #ifdef RVFI_DII
   uint64_t entry;
-  if (rvfi_dii) {
-    entry = 0x80000000;
+  if (rvfi_file_mode) {
+    entry = RVFI_RESET_PC;
+  } else if (rvfi_dii) {
+    entry = RVFI_RESET_PC;
     int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_sock == -1) {
       fprintf(stderr, "Unable to create socket: %s\n", strerror(errno));

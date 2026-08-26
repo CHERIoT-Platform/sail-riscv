@@ -98,7 +98,7 @@ mach_bits plat_rom_size(unit u)
 }
 
 // Provides entropy for the scalar cryptography extension.
-mach_bits plat_get_16_random_bits(unit u)
+mach_bits plat_get_16_random_bits()
 {
   return rv_16_random_bits();
 }

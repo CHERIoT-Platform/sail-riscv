@@ -24,6 +24,29 @@ bitfield RVFI_DII_Instruction_Packet : bits(64) = {
 
 register rvfi_instruction : RVFI_DII_Instruction_Packet
 
+// DII models mcycle as a deterministic maximal-length 32-bit LFSR.  The
+// polynomial is x^32 + x^22 + x^2 + x + 1.  A read returns the current state
+// and then advances it four times, matching a synchronous CSR read in RTL
+// while avoiding correlations between overlapping low nibbles.
+register rvfi_mcycle_lfsr : bits(32)
+
+val rvfi_mcycle_lfsr_step : bits(32) -> bits(32)
+function rvfi_mcycle_lfsr_step (state) = {
+  let feedback = state[31 .. 31] ^ state[21 .. 21] ^
+                 state[1 .. 1] ^ state[0 .. 0];
+  state[30 .. 0] @ feedback
+}
+
+val rvfi_read_mcycle_lfsr : unit -> bits(32)
+function rvfi_read_mcycle_lfsr () = {
+  let current = rvfi_mcycle_lfsr;
+  let next1 = rvfi_mcycle_lfsr_step(current);
+  let next2 = rvfi_mcycle_lfsr_step(next1);
+  let next3 = rvfi_mcycle_lfsr_step(next2);
+  rvfi_mcycle_lfsr = rvfi_mcycle_lfsr_step(next3);
+  current
+}
+
 val rvfi_set_instr_packet : bits(64) -> unit
 
 function rvfi_set_instr_packet(p) =
@@ -44,7 +67,7 @@ function print_instr_packet(bs) = {
   print_bits("command ", p[rvfi_cmd]);
   print_bits("instruction ", p[rvfi_insn])
 }
-
+/*
 bitfield RVFI_DII_Execution_Packet_V1 : bits(704) = {
    rvfi_intr      : 703 .. 696, // [87] Trap handler:            Set for first instruction in trap handler.
    rvfi_halt      : 695 .. 688, // [86] Halt indicator:          Marks the last instruction retired
@@ -69,6 +92,38 @@ bitfield RVFI_DII_Execution_Packet_V1 : bits(704) = {
    rvfi_pc_rdata  : 127 ..  64, // [08 - 15] PC before instr:         PC for current instruction
    rvfi_order     :  63 ..   0, // [00 - 07] Instruction number:      INSTRET value after completion.
 }
+*/
+
+bitfield RVFI_DII_Execution_Packet_V1 : bits(744) = {
+  rvfi_intr      : 743 .. 736,
+  rvfi_halt      : 735 .. 728,
+  rvfi_trap      : 727 .. 720,
+  rvfi_rd_addr   : 719 .. 712,
+  rvfi_rs2_addr  : 711 .. 704,
+  rvfi_rs1_addr  : 703 .. 696,
+
+  rvfi_mem_wmask : 695 .. 688,
+  rvfi_mem_rmask : 687 .. 680,
+
+  rvfi_mem_wdata : 679 .. 608,  // 72 bits
+  rvfi_mem_rdata : 607 .. 536,  // 72 bits
+  rvfi_mem_addr  : 535 .. 472,  // 64 bits
+
+  rvfi_rd_wdata  : 471 .. 400,  // 72 bits
+  rvfi_rs2_data  : 399 .. 328,  // 72 bits
+  rvfi_rs1_data  : 327 .. 256,  // 72 bits
+
+  rvfi_insn      : 255 .. 192,
+  rvfi_pc_wdata  : 191 .. 128,
+  rvfi_pc_rdata  : 127 .. 64,
+  rvfi_order     : 63 .. 0,
+}
+
+register rvfi_v1_rd_wdata72  : bits(72)
+register rvfi_v1_rs1_data72  : bits(72)
+register rvfi_v1_rs2_data72  : bits(72)
+register rvfi_v1_mem_rdata72 : bits(72)
+register rvfi_v1_mem_wdata72 : bits(72)
 
 bitfield RVFI_DII_Execution_Packet_InstMetaData : bits(192) = {
   /// The rvfi_order field must be set to the instruction index. No indices
@@ -198,6 +253,13 @@ register rvfi_int_data_present : bool
 register rvfi_mem_data : RVFI_DII_Execution_Packet_Ext_MemAccess
 register rvfi_mem_data_present : bool
 
+// Tracks which RVFI source-register slot the next rX call should fill.
+// Reset to 0 at the start of every step (in rvfi_zero_exec_packet).
+//   0b00  next rX read populates rs1
+//   0b01  next rX read populates rs2
+//   0b10  both slots already filled — drop further reads on the floor
+register rvfi_int_read_slot : bits(2)
+
 // Reset the trace
 val rvfi_zero_exec_packet : unit -> unit
 
@@ -212,6 +274,15 @@ function rvfi_zero_exec_packet () = {
   // magic = "mem-data" -> 0x617461642d6d656d (big-endian)
   rvfi_mem_data = update_magic(rvfi_mem_data, 0x617461642d6d656d);
   rvfi_mem_data_present = false;
+  // Reset the source-register read slot so the first two rX calls in
+  // this step land in rs1_{addr,rdata} and rs2_{addr,rdata}.
+  rvfi_int_read_slot = 0b00;
+
+  rvfi_v1_rd_wdata72  = zeros();
+  rvfi_v1_rs1_data72  = zeros();
+  rvfi_v1_rs2_data72  = zeros();
+  rvfi_v1_mem_rdata72 = zeros();
+  rvfi_v1_mem_wdata72 = zeros();
 }
 
 // FIXME: most of these will no longer be necessary once we use the c2 sail backend.
@@ -221,7 +292,8 @@ val rvfi_halt_exec_packet : unit -> unit
 function rvfi_halt_exec_packet () =
   rvfi_inst_data->rvfi_halt() = 0x01
 
-val rvfi_get_v2_support_packet : unit -> bits(704)
+// val rvfi_get_v2_support_packet : unit -> bits(704)
+val rvfi_get_v2_support_packet : unit -> bits(744)
 function rvfi_get_v2_support_packet () = {
   let rvfi_exec = Mk_RVFI_DII_Execution_Packet_V1(zero_extend(0b0));
   // Returning 0x3 (using the unused high bits) in halt instead of 0x1 means
@@ -232,7 +304,9 @@ function rvfi_get_v2_support_packet () = {
   return rvfi_exec.bits;
 }
 
-val rvfi_get_exec_packet_v1 : unit -> bits(704)
+//val rvfi_get_exec_packet_v1 : unit -> bits(704)
+val rvfi_get_exec_packet_v1 : unit -> bits(744)
+
 function rvfi_get_exec_packet_v1 () = {
   let v1_packet = Mk_RVFI_DII_Execution_Packet_V1(zero_extend(0b0));
   // Convert the v2 packet to a v1 packet
@@ -248,15 +322,22 @@ function rvfi_get_exec_packet_v1 () = {
   let v1_packet = update_rvfi_rd_addr(v1_packet, rvfi_int_data[rvfi_rd_addr]);
   let v1_packet = update_rvfi_rs2_addr(v1_packet, rvfi_int_data.rvfi_rs2_addr());
   let v1_packet = update_rvfi_rs1_addr(v1_packet, rvfi_int_data.rvfi_rs1_addr());
-  let v1_packet = update_rvfi_rd_wdata(v1_packet, rvfi_int_data[rvfi_rd_wdata]);
-  let v1_packet = update_rvfi_rs2_data(v1_packet, rvfi_int_data.rvfi_rs2_rdata());
-  let v1_packet = update_rvfi_rs1_data(v1_packet, rvfi_int_data.rvfi_rs1_rdata());
+  //let v1_packet = update_rvfi_rd_wdata(v1_packet, rvfi_int_data[rvfi_rd_wdata]);
+  //let v1_packet = update_rvfi_rs2_data(v1_packet, rvfi_int_data.rvfi_rs2_rdata());
+  //let v1_packet = update_rvfi_rs1_data(v1_packet, rvfi_int_data.rvfi_rs1_rdata());
+
+  let v1_packet = update_rvfi_rd_wdata(v1_packet,  rvfi_v1_rd_wdata72);
+  let v1_packet = update_rvfi_rs2_data(v1_packet,  rvfi_v1_rs2_data72);
+  let v1_packet = update_rvfi_rs1_data(v1_packet,  rvfi_v1_rs1_data72);
 
   let v1_packet = update_rvfi_mem_wmask(v1_packet, truncate(rvfi_mem_data[rvfi_mem_wmask], 8));
   let v1_packet = update_rvfi_mem_rmask(v1_packet, truncate(rvfi_mem_data[rvfi_mem_rmask], 8));
-  let v1_packet = update_rvfi_mem_wdata(v1_packet, truncate(rvfi_mem_data[rvfi_mem_wdata], 64));
-  let v1_packet = update_rvfi_mem_rdata(v1_packet, truncate(rvfi_mem_data[rvfi_mem_rdata], 64));
+  //let v1_packet = update_rvfi_mem_wdata(v1_packet, truncate(rvfi_mem_data[rvfi_mem_wdata], 64));
+  //let v1_packet = update_rvfi_mem_rdata(v1_packet, truncate(rvfi_mem_data[rvfi_mem_rdata], 64));
   let v1_packet = update_rvfi_mem_addr(v1_packet, rvfi_mem_data[rvfi_mem_addr]);
+
+  let v1_packet = update_rvfi_mem_wdata(v1_packet, rvfi_v1_mem_wdata72);
+  let v1_packet = update_rvfi_mem_rdata(v1_packet, rvfi_v1_mem_rdata72);
 
   return v1_packet.bits;
 }

@@ -21,6 +21,12 @@ mapping encdec_csrop : csrop <-> bits(2) = {
 mapping clause encdec = CSR(csr, rs1, rd, is_imm, op)
   <-> csr @ rs1 @ bool_bits(is_imm) @ encdec_csrop(op) @ rd @ 0b1110011
 
+$ifdef RVFI_DII
+function read_mcycle_value() -> xlenbits = zero_extend(rvfi_read_mcycle_lfsr())
+$else
+function read_mcycle_value() -> xlenbits = mcycle[(sizeof(xlen) - 1) .. 0]
+$endif
+
 function readCSR csr : csreg -> xlenbits = {
   let res : xlenbits =
   match (csr, sizeof(xlen)) {
@@ -56,7 +62,7 @@ function readCSR csr : csreg -> xlenbits = {
     (0x3E @ idx : bits(4),  _) => pmpReadAddrReg(unsigned(0b11 @ idx)),
 
     /* machine mode counters */
-    (0xB00,  _) => mcycle[(sizeof(xlen) - 1) .. 0],
+    (0xB00,  _) => read_mcycle_value(),
     (0xB02,  _) => minstret[(sizeof(xlen) - 1) .. 0],
     (0xB80, 32) => mcycle[63 .. 32],
     (0xB82, 32) => minstret[63 .. 32],
