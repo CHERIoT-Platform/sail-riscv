@@ -24,6 +24,29 @@ bitfield RVFI_DII_Instruction_Packet : bits(64) = {
 
 register rvfi_instruction : RVFI_DII_Instruction_Packet
 
+// DII models mcycle as a deterministic maximal-length 32-bit LFSR.  The
+// polynomial is x^32 + x^22 + x^2 + x + 1.  A read returns the current state
+// and then advances it four times, matching a synchronous CSR read in RTL
+// while avoiding correlations between overlapping low nibbles.
+register rvfi_mcycle_lfsr : bits(32)
+
+val rvfi_mcycle_lfsr_step : bits(32) -> bits(32)
+function rvfi_mcycle_lfsr_step (state) = {
+  let feedback = state[31 .. 31] ^ state[21 .. 21] ^
+                 state[1 .. 1] ^ state[0 .. 0];
+  state[30 .. 0] @ feedback
+}
+
+val rvfi_read_mcycle_lfsr : unit -> bits(32)
+function rvfi_read_mcycle_lfsr () = {
+  let current = rvfi_mcycle_lfsr;
+  let next1 = rvfi_mcycle_lfsr_step(current);
+  let next2 = rvfi_mcycle_lfsr_step(next1);
+  let next3 = rvfi_mcycle_lfsr_step(next2);
+  rvfi_mcycle_lfsr = rvfi_mcycle_lfsr_step(next3);
+  current
+}
+
 val rvfi_set_instr_packet : bits(64) -> unit
 
 function rvfi_set_instr_packet(p) =

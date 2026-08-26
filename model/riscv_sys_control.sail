@@ -477,6 +477,12 @@ function handle_interrupt(i : InterruptType, del_priv : Privilege) -> unit =
 
 /* state state initialization */
 
+$ifdef RVFI_DII
+function init_mcycle_lfsr() -> unit = rvfi_mcycle_lfsr = 0xdeadbeef
+$else
+function init_mcycle_lfsr() -> unit = ()
+$endif
+
 function init_sys() -> unit = {
   cur_privilege = Machine;
 
@@ -527,6 +533,7 @@ function init_sys() -> unit = {
   mscratch        = zero_extend(0b0);
 
   mcycle          = zero_extend(0b0);
+  init_mcycle_lfsr();
   mtime           = zero_extend(0b0);
 
   mcounteren.bits = zero_extend(0b0);

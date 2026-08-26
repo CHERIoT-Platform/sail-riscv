@@ -225,9 +225,10 @@ union clause ast = C_SRLI : (bits(6), cregidx)
 
 // c.srli64 (with shamt=0) are hints.
 // c.srli with nzuimm[5] == 1 are NSEs
-mapping clause encdec_compressed = C_SRLI(shamt, rsd)
-  <-> 0b100 @ shamt[5] @ 0b00 @ rsd : cregidx @ shamt[4..0] @ 0b01
-  when (shamt[5] == 0b0) & (shamt != 0b000000)
+mapping clause encdec_compressed = C_SRLI(nzui5 @ nzui40, rsd)
+      if (nzui5 == 0b0) & (nzui40 != 0b00000)
+  <-> 0b100 @ nzui5 : bits(1) @ 0b00 @ rsd : cregidx @ nzui40 : bits(5) @ 0b01
+      if (nzui5 == 0b0) & (nzui40 != 0b00000)
 
 /*
 mapping clause encdec_compressed = C_SRLI(nzui5 @ nzui40, rsd)
@@ -251,9 +252,10 @@ union clause ast = C_SRAI : (bits(6), cregidx)
 
 // c.srai64 (with shamt=0) are hints.
 // c.srai with nzuimm[5] == 1 are NSEs
-mapping clause encdec_compressed = C_SRAI(shamt, rsd)
-  <-> 0b100 @ shamt[5] @ 0b01 @ rsd : cregidx @ shamt[4..0] @ 0b01
-  when (shamt[5] == 0b0) & (shamt != 0b000000)
+mapping clause encdec_compressed = C_SRAI(nzui5 @ nzui40, rsd)
+      if (nzui5 == 0b0) & (nzui40 != 0b00000)
+  <-> 0b100 @ nzui5 : bits(1) @ 0b01 @ rsd : cregidx @ nzui40 : bits(5) @ 0b01
+      if (nzui5 == 0b0) & (nzui40 != 0b00000)
 
 /*
 mapping clause encdec_compressed = C_SRAI(nzui5 @ nzui40, rsd)
